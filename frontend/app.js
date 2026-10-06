@@ -67,6 +67,20 @@ async function loadNotebooks(targetId) {
   await selectNotebook(match.id);
 }
 
+async function updateNotebookTotalCost() {
+  if (!currentNotebookId) return;
+  try {
+    const data = await api(`/notebooks/${currentNotebookId}/cost`);
+    const cost = Number(data.total_cost || 0);
+    const badgeVal = $("nb-total-cost");
+    if (badgeVal) {
+      badgeVal.textContent = `$${cost.toFixed(4)}`;
+    }
+  } catch (e) {
+    console.warn("Cost update:", e);
+  }
+}
+
 async function selectNotebook(id) {
   currentNotebookId = id;
   localStorage.setItem("active_nb", id);
@@ -80,6 +94,7 @@ async function selectNotebook(id) {
   switchToSourcesListView();
   await refreshSources();
   await loadMessages();
+  await updateNotebookTotalCost();
 }
 
 $("nb-select").onchange = safeAction(e => selectNotebook(+e.target.value));
@@ -90,13 +105,37 @@ $("btn-new-nb").onclick = safeAction(async () => {
   await loadNotebooks(nb.id);
 });
 
-$("nb-title").onchange = safeAction(async () => {
-  const title = $("nb-title").value.trim() || "Untitled notebook";
+async function renameNotebook(newTitle) {
+  const title = (newTitle || "").trim() || "Untitled notebook";
   await api(`/notebooks/${currentNotebookId}`, { method: "PATCH", json: { title } });
+  $("nb-title").value = title;
   $("canvas-heading").textContent = title;
   notebooks = await api("/notebooks");
-  showToast("Title updated.");
+  $("nb-select").innerHTML = notebooks.map(n => `<option value="${n.id}" ${n.id === currentNotebookId ? "selected" : ""}>${esc(n.title)}</option>`).join("");
+  showToast("Notebook renamed.");
+}
+
+$("nb-title").onchange = safeAction(async () => {
+  await renameNotebook($("nb-title").value);
 });
+
+$("nb-title").onkeydown = e => {
+  if (e.key === "Enter") {
+    e.target.blur();
+  }
+};
+
+const canvasHeading = $("canvas-heading");
+canvasHeading.onblur = safeAction(async () => {
+  await renameNotebook(canvasHeading.textContent);
+});
+
+canvasHeading.onkeydown = e => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    canvasHeading.blur();
+  }
+};
 
 $("btn-share").onclick = () => {
   navigator.clipboard?.writeText(location.href);
@@ -320,11 +359,24 @@ $("btn-explain-highlight").onclick = safeAction(async () => {
 
 // ----------------- Center Canvas: Chat & Interactive Citations -----------------
 
+function scrollToBottom(smooth = true) {
+  setTimeout(() => {
+    const scrollEl = $("canvas-scroll");
+    if (scrollEl) {
+      scrollEl.scrollTo({
+        top: scrollEl.scrollHeight,
+        behavior: smooth ? "smooth" : "auto"
+      });
+    }
+  }, 50);
+}
+
 async function loadMessages() {
   const chatEl = $("chat-messages");
   const messages = await api(`/notebooks/${currentNotebookId}/messages`);
   chatEl.innerHTML = "";
   messages.forEach(m => renderMessageBubble(m.role, m.content, m.citations, m));
+  scrollToBottom(false);
 }
 
 function renderMessageBubble(role, content, citations = [], meta = {}) {
@@ -347,8 +399,26 @@ function renderMessageBubble(role, content, citations = [], meta = {}) {
 
   msgDiv.innerHTML = formattedContent;
 
+  // Render Query Time & Cost info on assistant messages
+  if (role === "assistant" && meta && (meta.cost_usd !== undefined || meta.latency_s !== undefined)) {
+    const infoLine = document.createElement("div");
+    infoLine.className = "msg-query-meta";
+    const costText = meta.cost_usd !== undefined ? `$${Number(meta.cost_usd).toFixed(6)}` : "$0.0000";
+    const timeText = meta.latency_s !== undefined ? `${meta.latency_s}s` : "";
+    const tokensText = meta.total_tokens ? `${meta.total_tokens} tokens` : (meta.prompt_tokens ? `${meta.prompt_tokens + (meta.completion_tokens || 0)} tokens` : "");
+
+    const parts = [
+      `<span>⚡ ${costText}</span>`,
+      timeText ? `<span>⏱ ${timeText}</span>` : "",
+      tokensText ? `<span>📊 ${tokensText}</span>` : ""
+    ].filter(Boolean);
+
+    infoLine.innerHTML = parts.join(' <span class="meta-sep">·</span> ');
+    msgDiv.appendChild(infoLine);
+  }
+
   chatEl.appendChild(msgDiv);
-  $("canvas-scroll").scrollTop = $("canvas-scroll").scrollHeight;
+  scrollToBottom(true);
   return msgDiv;
 }
 
@@ -394,6 +464,7 @@ async function handleSendChat() {
 
     loadingBubble.remove();
     renderMessageBubble("assistant", res.answer, res.citations, res);
+    await updateNotebookTotalCost();
   } catch (err) {
     loadingBubble.remove();
     showToast(err.message);

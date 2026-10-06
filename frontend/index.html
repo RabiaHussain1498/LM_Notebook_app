@@ -25,6 +25,11 @@
     </div>
 
     <div class="topbar-right">
+      <div class="nb-cost-badge" id="nb-cost-badge" title="Total cumulative cost for this notebook">
+        <span class="cost-icon">⚡</span>
+        <span class="cost-label">Total Cost:</span>
+        <span class="cost-val" id="nb-total-cost">$0.0000</span>
+      </div>
       <button id="btn-new-nb" class="btn-top">+ Create notebook</button>
       <button id="btn-share" class="btn-top">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"></path><polyline points="16 6 12 2 8 6"></polyline><line x1="12" y1="2" x2="12" y2="15"></line></svg>
@@ -121,7 +126,9 @@
             </div>
           </div>
 
-          <h1 class="main-notebook-heading" id="canvas-heading">Untitled notebook</h1>
+          <div class="heading-container">
+            <h1 class="editable-heading" id="canvas-heading" contenteditable="true" spellcheck="false" title="Click to rename notebook">Untitled notebook</h1>
+          </div>
           <div class="main-meta-line" id="canvas-meta">0 sources · Oct 7, 2026</div>
 
           <!-- Chat Messages Container -->

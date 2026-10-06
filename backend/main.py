@@ -13,6 +13,7 @@ import re
 import secrets
 import socket
 import sqlite3
+import time
 from contextlib import asynccontextmanager, closing
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -502,6 +503,28 @@ def create_notebook(body: NotebookIn, user: dict = Depends(get_current_user)):
     nid = db_execute("INSERT INTO notebooks(user_id, title) VALUES (?, ?)", (user["id"], (body.title.strip() or "Untitled notebook")[:120]))
     return {"id": nid, "title": body.title}
 
+@app.get("/api/notebooks/{nid}/cost")
+def get_notebook_cost(nid: int, user: dict = Depends(get_current_user)):
+    costs = db_query(
+        "SELECT SUM(cost_usd) as total_cost, SUM(prompt_tokens) as prompt_tokens, SUM(completion_tokens) as completion_tokens, COUNT(id) as total_queries FROM messages WHERE notebook_id = ? AND role = 'assistant'",
+        (nid,)
+    )
+    emb_costs = db_query(
+        "SELECT SUM(cost_usd) as emb_cost FROM usage_logs WHERE notebook_id = ? AND operation = 'embedding'",
+        (nid,)
+    )
+    total_msg_cost = (costs[0]["total_cost"] or 0.0) if costs else 0.0
+    total_emb_cost = (emb_costs[0]["emb_cost"] or 0.0) if emb_costs else 0.0
+    total_spent = total_msg_cost + total_emb_cost
+    
+    return {
+        "notebook_id": nid,
+        "total_cost": round(total_spent, 6),
+        "prompt_tokens": (costs[0]["prompt_tokens"] or 0) if costs else 0,
+        "completion_tokens": (costs[0]["completion_tokens"] or 0) if costs else 0,
+        "total_queries": (costs[0]["total_queries"] or 0) if costs else 0
+    }
+
 @app.patch("/api/notebooks/{nid}")
 def rename_notebook(nid: int, body: NotebookIn, user: dict = Depends(get_current_user)):
     db_execute("UPDATE notebooks SET title = ? WHERE id = ? AND user_id = ?", (body.title.strip()[:120] or "Untitled notebook", nid, user["id"]))
@@ -680,6 +703,7 @@ def get_messages(nid: int, user: dict = Depends(get_current_user)):
 
 @app.post("/api/notebooks/{nid}/chat")
 def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(get_current_user)):
+    t0 = time.time()
     question = body.question.strip()
     if not question:
         raise HTTPException(400, "Please enter a question.")
@@ -698,14 +722,14 @@ def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(get_current_u
         prompt_tok = 0
         comp_tok = 0
     else:
-        citations = []
+        raw_citations = []
         context_parts = []
 
         if body.highlighted_context:
             context_parts.append(f"[Selection] Highlighted passage from document:\n{body.highlighted_context}")
 
         for idx, hit in enumerate(hits, 1):
-            citations.append({
+            raw_citations.append({
                 "n": idx,
                 "source_id": hit["source_id"],
                 "source_name": hit["source_name"],
@@ -756,15 +780,37 @@ def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(get_current_u
                 
                 p_rates = PRICING.get(OPENAI_MODEL, PRICING["gpt-4o-mini"])
                 cost_usd = (prompt_tok * p_rates["input"]) + (comp_tok * p_rates["output"]) + ret_cost
+
+                # Automatically re-index citations sequentially (e.g. [1],[2],[4] -> [1],[2],[3])
+                old_to_new = {}
+                used_citations = []
+                for m in re.finditer(r"\[(\d+)\]", answer):
+                    old_n = int(m.group(1))
+                    if old_n not in old_to_new and 1 <= old_n <= len(raw_citations):
+                        new_n = len(old_to_new) + 1
+                        old_to_new[old_n] = new_n
+                        orig = raw_citations[old_n - 1].copy()
+                        orig["n"] = new_n
+                        used_citations.append(orig)
+
+                if old_to_new:
+                    answer = re.sub(r"\[(\d+)\]", lambda m: f"[{old_to_new.get(int(m.group(1)), m.group(1))}]", answer)
+                    citations = used_citations
+                else:
+                    citations = raw_citations
+
             except Exception as e:
                 raise HTTPException(502, f"OpenAI generation failed: {e}")
         else:
             cost_usd = 0.0
             prompt_tok = 0
             comp_tok = 0
+            citations = raw_citations
             answer = "### Matching Passages (Local Mode):\n\n" + "\n\n".join(
                 f"**[{c['n']}] {c['source_name']}:**\n> {hits[i]['content']}" for i, c in enumerate(citations)
             )
+
+    latency_s = round(time.time() - t0, 2)
 
     db_execute(
         "INSERT INTO messages(notebook_id, user_id, role, content, target_source_id) VALUES (?, ?, 'user', ?, ?)",
@@ -787,8 +833,10 @@ def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(get_current_u
         "answer": answer,
         "citations": citations,
         "cost_usd": round(cost_usd, 6),
+        "latency_s": latency_s,
         "prompt_tokens": prompt_tok,
         "completion_tokens": comp_tok,
+        "total_tokens": prompt_tok + comp_tok,
         "strategy": strategy,
         "model": OPENAI_MODEL if OPENAI_KEY else "Local Mode"
     }
