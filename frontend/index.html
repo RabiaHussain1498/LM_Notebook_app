@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notebook</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="logo" aria-hidden="true">∩</div>
+  <input id="title" aria-label="Notebook title">
+  <select id="nbsel" aria-label="Switch notebook"></select>
+  <button class="hbtn" id="newnb">+ Create notebook</button>
+  <button class="hbtn" id="share">Share</button>
+  <button class="hbtn" id="delnb" aria-label="Delete notebook">Delete</button>
+  <span class="badge" id="mode"></span>
+</header>
+<main>
+  <aside id="side">
+    <div class="shead"><b>Sources</b><button id="min" aria-label="Collapse sources">▢</button></div>
+    <div class="sbody-wrap">
+      <button class="addbtn" id="add">+ Add sources</button>
+      <form class="web" id="webform"><input id="webq" placeholder="Search the web or paste a URL" aria-label="Search the web or paste a URL"><button class="go" aria-label="Search">→</button></form>
+      <div id="results"></div>
+      <div id="list"></div>
+    </div>
+  </aside>
+  <section class="sec">
+    <div id="chat"></div>
+    <div class="bar">
+      <input id="q" placeholder="Ask a question or create something" aria-label="Ask a question">
+      <small id="cnt">0 sources</small>
+      <button class="send" id="send" aria-label="Send">↑</button>
+    </div>
+  </section>
+</main>
+<dialog id="dlg">
+  <h2>Add sources</h2>
+  <div id="drop">Drop .pdf / .txt / .md / .csv files here or <label class="lnk">browse<input id="file" type="file" accept=".pdf,.txt,.md,.csv" multiple hidden></label></div>
+  <input type="text" id="sname" placeholder="Source name (optional)">
+  <textarea id="stext" placeholder="Or paste text here"></textarea>
+  <div class="row"><button id="cancel" class="hbtn">Cancel</button><button id="save" class="pri">Add source</button></div>
+</dialog>
+<div id="toast" role="status"></div>
+<script src="app.js"></script>
+</body>
+</html>
