@@ -173,10 +173,17 @@ function renderSourcesList() {
   listEl.innerHTML = sources.map(s => {
     const icon = getKindIcon(s.kind);
     const isSelected = currentDocId === s.id ? "selected-reading" : "";
+    const chunks = s.chunks_count !== undefined ? s.chunks_count : 0;
+    const chunkLabel = `${chunks} chunk${chunks === 1 ? "" : "s"}`;
     return `
       <div class="source-item-row ${isSelected}" data-id="${s.id}">
         <span class="source-icon-badge">${icon}</span>
-        <span class="source-row-title" title="${esc(s.name)}">${esc(s.name)}</span>
+        <div class="source-row-info">
+          <span class="source-row-title" title="${esc(s.name)}">${esc(s.name)}</span>
+          <div class="source-row-meta">
+            <span class="source-chunk-badge" title="${chunkLabel} indexed in ChromaDB">🧩 ${chunkLabel}</span>
+          </div>
+        </div>
         <input type="checkbox" class="source-checkbox" data-id="${s.id}" ${s.enabled ? "checked" : ""} onclick="event.stopPropagation()">
       </div>
     `;
@@ -200,7 +207,8 @@ async function openDocPreviewInLeftBar(sourceId, highlightChunkIndex = null, hig
   $("view-doc-preview").classList.remove("hidden");
   $("sidebar-title-text").textContent = "Sources";
   $("doc-preview-title").textContent = details.name;
-  $("doc-emb-tag").textContent = details.embedding_model || "emb-3-small";
+  const chunksCount = details.chunks ? details.chunks.length : (details.chunks_count || 0);
+  $("doc-emb-tag").textContent = `${details.embedding_model || "emb-3-small"} · ${chunksCount} chunk${chunksCount === 1 ? "" : "s"}`;
 
   const container = $("doc-content-body");
   if (details.chunks && details.chunks.length) {

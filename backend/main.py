@@ -16,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import chromadb
+from chromadb.config import Settings
 import requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
@@ -26,8 +28,16 @@ load_dotenv()
 DB = os.environ.get("DB_PATH", "notebook.db")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
+CHROMA_DIR = os.environ.get("CHROMA_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "chroma_db"))
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB
+
+# Initialize Persistent ChromaDB Client & Collection
+chroma_client = chromadb.PersistentClient(path=os.path.abspath(CHROMA_DIR))
+rag_collection = chroma_client.get_or_create_collection(
+    name="notebook_rag",
+    metadata={"hnsw:space": "cosine"}
+)
 
 # Pricing constants (USD per token)
 PRICING = {
@@ -182,12 +192,56 @@ def get_demo_user() -> dict:
     uid = db_execute("INSERT INTO users(username) VALUES (?)", ("demo_user",))
     return {"id": uid, "username": "demo_user", "total_cost": 0.0}
 
+def sync_sqlite_to_chroma():
+    """Sync any existing chunks from SQLite to ChromaDB on startup"""
+    try:
+        raw_chunks = db_query("""
+            SELECT c.id AS chunk_id, c.chunk_index, c.content, c.embedding, s.id AS source_id, s.name AS source_name, s.kind, s.notebook_id
+            FROM chunks c
+            JOIN sources s ON c.source_id = s.id
+        """)
+        if not raw_chunks:
+            return
+        
+        ids = []
+        docs = []
+        metas = []
+        embeddings = []
+        has_embs = True
+
+        for r in raw_chunks:
+            ids.append(f"c_{r['chunk_id']}")
+            docs.append(r["content"])
+            metas.append({
+                "notebook_id": int(r["notebook_id"]),
+                "source_id": int(r["source_id"]),
+                "source_name": str(r["source_name"]),
+                "chunk_id": int(r["chunk_id"]),
+                "chunk_index": int(r["chunk_index"]),
+                "kind": str(r["kind"] or "text")
+            })
+            if r["embedding"]:
+                try:
+                    embeddings.append(json.loads(r["embedding"]))
+                except Exception:
+                    has_embs = False
+            else:
+                has_embs = False
+
+        if has_embs and len(embeddings) == len(ids):
+            rag_collection.upsert(ids=ids, embeddings=embeddings, documents=docs, metadatas=metas)
+        else:
+            rag_collection.upsert(ids=ids, documents=docs, metadatas=metas)
+    except Exception as e:
+        print(f"Chroma startup sync notice: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     with closing(sqlite3.connect(DB)) as c:
         c.executescript(SCHEMA)
         migrate_db(c)
     get_demo_user()
+    sync_sqlite_to_chroma()
     yield
 
 app = FastAPI(title="NotebookLM AI App", lifespan=lifespan)
@@ -200,29 +254,131 @@ STOPWORDS = set("the a an is are was were of to in on and or for with what how w
 def tokenize(text: str) -> List[str]:
     return [w for w in re.findall(r"[a-z0-9']+", text.lower()) if w not in STOPWORDS and len(w) > 1]
 
-def chunk_text(text: str, kind: str = "text", size: int = 550, overlap: int = 60) -> List[str]:
-    if kind in ("code", "table"):
-        lines = [line for line in text.split("\n") if line.strip()]
-        chunks_out, cur = [], ""
-        for line in lines:
-            if cur and len(cur) + len(line) > size:
-                chunks_out.append(cur)
-                cur = ""
-            cur += ("\n" if cur else "") + line
-        if cur:
-            chunks_out.append(cur)
-        return chunks_out or [text[:size]]
+def chunk_markdown_or_text(text: str, target_size: int = 550, overlap: int = 70) -> List[str]:
+    """
+    Hybrid Structural + Sentence Chunking for Prose, PDFs, Notes, Markdown & Web Pages:
+    1. Tracks section/header hierarchy (# H1, ## H2, ### H3, Section:).
+    2. Splits along natural paragraphs & bullet points.
+    3. Splits large paragraphs along sentence boundaries ([.!?]).
+    4. Applies contextual sliding overlap without cutting mid-sentence.
+    """
+    normalized = re.sub(r"\r\n|\r", "\n", text).strip()
+    if not normalized:
+        return []
 
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n|(?<=[.!?])\s+", text) if p.strip()]
-    chunks_out, cur = [], ""
-    for p in paragraphs:
-        if cur and len(cur) + len(p) > size:
-            chunks_out.append(cur)
-            cur = cur[-overlap:] if len(cur) > overlap else ""
-        cur += (" " if cur else "") + p
-    if cur:
-        chunks_out.append(cur)
-    return chunks_out or [text[:size]]
+    lines = normalized.split("\n")
+    sections = []
+    current_header = ""
+    current_block = []
+
+    for line in lines:
+        header_match = re.match(r"^(#{1,6}\s+.+|[A-Z0-9\s]{3,40}:)$", line.strip())
+        if header_match:
+            if current_block:
+                sections.append((current_header, "\n".join(current_block)))
+                current_block = []
+            current_header = header_match.group(1).strip()
+        current_block.append(line)
+
+    if current_block:
+        sections.append((current_header, "\n".join(current_block)))
+
+    chunks_out = []
+
+    for header, content in sections:
+        header_prefix = f"[{header}]\n" if header and not content.startswith(header) else ""
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", content) if p.strip()]
+        
+        current_chunk = ""
+        for para in paragraphs:
+            if len(para) > target_size:
+                sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", para) if s.strip()]
+                for sentence in sentences:
+                    if current_chunk and len(current_chunk) + len(sentence) > target_size:
+                        chunks_out.append(current_chunk.strip())
+                        overlap_text = current_chunk[-overlap:].strip()
+                        current_chunk = (header_prefix + overlap_text + " " if overlap_text else header_prefix) + sentence
+                    else:
+                        current_chunk += (" " if current_chunk else header_prefix) + sentence
+            else:
+                if current_chunk and len(current_chunk) + len(para) > target_size:
+                    chunks_out.append(current_chunk.strip())
+                    overlap_text = current_chunk[-overlap:].strip()
+                    current_chunk = (header_prefix + overlap_text + "\n\n" if overlap_text else header_prefix) + para
+                else:
+                    current_chunk += ("\n\n" if current_chunk else header_prefix) + para
+
+        if current_chunk.strip():
+            chunks_out.append(current_chunk.strip())
+
+    return chunks_out or [normalized[:target_size]]
+
+def chunk_code(text: str, target_size: int = 600, overlap_lines: int = 2) -> List[str]:
+    """
+    Structural Code Chunking:
+    - Splits along class, function, or block boundaries.
+    - Preserves indentation and syntax integrity.
+    """
+    lines = text.split("\n")
+    chunks_out = []
+    current_lines = []
+    
+    block_start_regex = re.compile(r"^\s*(def |class |async def |function |export |public |private |struct |impl |SELECT |CREATE |INSERT )")
+    
+    for line in lines:
+        if block_start_regex.match(line) and current_lines and sum(len(l) for l in current_lines) >= target_size // 2:
+            chunks_out.append("\n".join(current_lines).strip())
+            current_lines = current_lines[-overlap_lines:] if len(current_lines) > overlap_lines else []
+        
+        current_lines.append(line)
+        if sum(len(l) for l in current_lines) > target_size:
+            chunks_out.append("\n".join(current_lines).strip())
+            current_lines = current_lines[-overlap_lines:] if len(current_lines) > overlap_lines else []
+
+    if current_lines:
+        chunk_str = "\n".join(current_lines).strip()
+        if chunk_str:
+            chunks_out.append(chunk_str)
+
+    return chunks_out or [text[:target_size]]
+
+def chunk_tabular(text: str, target_size: int = 550) -> List[str]:
+    """
+    Schema-Aware Tabular Chunking for CSV/TSV:
+    - Extracts header row and prefixes each chunk with column names so embeddings understand the schema.
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if not lines:
+        return []
+    
+    header = lines[0]
+    data_rows = lines[1:]
+    if not data_rows:
+        return [header]
+        
+    chunks_out = []
+    current_chunk_rows = []
+    
+    for row in data_rows:
+        projected_size = len(header) + sum(len(r) + 1 for r in current_chunk_rows) + len(row)
+        if current_chunk_rows and projected_size > target_size:
+            chunks_out.append(f"[Columns: {header}]\n" + "\n".join(current_chunk_rows))
+            current_chunk_rows = []
+        current_chunk_rows.append(row)
+        
+    if current_chunk_rows:
+        chunks_out.append(f"[Columns: {header}]\n" + "\n".join(current_chunk_rows))
+        
+    return chunks_out
+
+def chunk_text(text: str, kind: str = "text", size: int = 550, overlap: int = 70) -> List[str]:
+    """Master Hybrid Structural + Semantic Chunking Router"""
+    if kind == "code":
+        return chunk_code(text, target_size=size)
+    elif kind == "table":
+        return chunk_tabular(text, target_size=size)
+    else:
+        return chunk_markdown_or_text(text, target_size=size, overlap=overlap)
 
 def select_embedding_model(kind: str, text: str) -> str:
     if not OPENAI_KEY:
@@ -274,31 +430,69 @@ def retrieve_top_chunks(
         return [], "none", 0.0
 
     retrieval_cost = 0.0
-    strategy_used = "tf-idf"
+    strategy_used = "chromadb-vector"
 
-    has_vectors = raw_chunks and raw_chunks[0]["embedding"] is not None and OPENAI_KEY
-    if has_vectors:
+    # 1. Primary retrieval: ChromaDB Vector Similarity Search
+    if OPENAI_KEY:
         try:
             emb_model = "text-embedding-3-small"
             q_embeddings, tokens, cost = compute_openai_embedding([query], emb_model)
             retrieval_cost += cost
-            strategy_used = emb_model
-            q_vec = q_embeddings[0]
+            strategy_used = f"ChromaDB ({emb_model})"
 
-            scored_chunks = []
-            for item in raw_chunks:
-                if item["embedding"]:
-                    vec = json.loads(item["embedding"])
-                    score = cosine_similarity(q_vec, vec)
-                    scored_chunks.append((score, item))
-            
-            scored_chunks.sort(key=lambda x: -x[0])
-            top_results = [item for score, item in scored_chunks[:k] if score > 0.15]
-            if top_results:
-                return top_results, strategy_used, retrieval_cost
+            enabled_sids = list(set(int(r["source_id"]) for r in raw_chunks))
+            if len(enabled_sids) == 1:
+                where_filter = {
+                    "$and": [
+                        {"notebook_id": {"$eq": int(notebook_id)}},
+                        {"source_id": {"$eq": int(enabled_sids[0])}}
+                    ]
+                }
+            else:
+                where_filter = {
+                    "$and": [
+                        {"notebook_id": {"$eq": int(notebook_id)}},
+                        {"source_id": {"$in": [int(sid) for sid in enabled_sids]}}
+                    ]
+                }
+
+            chroma_count = rag_collection.count()
+            if chroma_count > 0:
+                query_res = rag_collection.query(
+                    query_embeddings=q_embeddings,
+                    n_results=min(k * 2, chroma_count),
+                    where=where_filter
+                )
+                
+                if query_res and query_res.get("ids") and query_res["ids"][0]:
+                    hits = []
+                    res_ids = query_res["ids"][0]
+                    res_docs = query_res["documents"][0]
+                    res_metas = query_res["metadatas"][0]
+                    res_dists = query_res.get("distances", [[]])[0] or [0.0] * len(res_ids)
+
+                    for cid_str, doc_text, meta, dist in zip(res_ids, res_docs, res_metas, res_dists):
+                        score = round(1.0 - dist, 4) if dist is not None else 1.0
+                        if score > 0.15:
+                            raw_cid = meta.get("chunk_id")
+                            if raw_cid is None:
+                                raw_cid = int(cid_str.replace("c_", "")) if str(cid_str).startswith("c_") else int(cid_str)
+                            hits.append({
+                                "chunk_id": int(raw_cid),
+                                "chunk_index": meta.get("chunk_index", 0),
+                                "content": doc_text,
+                                "source_id": meta.get("source_id"),
+                                "source_name": meta.get("source_name", "Source"),
+                                "kind": meta.get("kind", "text"),
+                                "score": score
+                            })
+
+                    if hits:
+                        return hits[:k], strategy_used, retrieval_cost
         except Exception as e:
-            print(f"Vector search fallback: {e}")
+            print(f"ChromaDB query fallback: {e}")
 
+    # 2. Local TF-IDF / Overview fallback
     strategy_used = "tf-idf-local"
     if re.search(r"summar|overview|main points|tl;?dr", query, re.I):
         top_chunks = []
@@ -422,6 +616,10 @@ def rename_notebook(nid: int, body: NotebookIn, user: dict = Depends(current_use
 
 @app.delete("/api/notebooks/{nid}")
 def delete_notebook(nid: int, user: dict = Depends(current_user)):
+    try:
+        rag_collection.delete(where={"notebook_id": {"$eq": int(nid)}})
+    except Exception as e:
+        print(f"Chroma delete notebook notice: {e}")
     db_execute("DELETE FROM notebooks WHERE id = ? AND user_id = ?", (nid, user["id"]))
     return {"ok": True}
 
@@ -448,12 +646,42 @@ def store_source_and_index(notebook_id: int, user_id: int, name: str, kind: str,
             print(f"Embedding error: {e}")
             embeddings = []
 
+    chunk_ids = []
     for idx, chunk_content in enumerate(raw_chunks):
         emb_json = json.dumps(embeddings[idx]) if idx < len(embeddings) else None
-        db_execute(
+        cid = db_execute(
             "INSERT INTO chunks(source_id, chunk_index, content, embedding, tokens) VALUES (?, ?, ?, ?, ?)",
             (sid, idx, chunk_content, emb_json, len(chunk_content.split()))
         )
+        chunk_ids.append(cid)
+
+    # Upsert chunks and embeddings into ChromaDB collection
+    try:
+        chroma_ids = [f"c_{cid}" for cid in chunk_ids]
+        chroma_metas = [{
+            "notebook_id": int(notebook_id),
+            "source_id": int(sid),
+            "source_name": str(name),
+            "chunk_id": int(cid),
+            "chunk_index": int(idx),
+            "kind": str(kind)
+        } for idx, cid in enumerate(chunk_ids)]
+
+        if embeddings and len(embeddings) == len(raw_chunks):
+            rag_collection.upsert(
+                ids=chroma_ids,
+                embeddings=embeddings,
+                documents=raw_chunks,
+                metadatas=chroma_metas
+            )
+        else:
+            rag_collection.upsert(
+                ids=chroma_ids,
+                documents=raw_chunks,
+                metadatas=chroma_metas
+            )
+    except Exception as e:
+        print(f"ChromaDB upsert notice: {e}")
 
     return {
         "id": sid,
@@ -469,7 +697,13 @@ def store_source_and_index(notebook_id: int, user_id: int, name: str, kind: str,
 @app.get("/api/notebooks/{nid}/sources")
 def list_sources(nid: int, user: dict = Depends(current_user)):
     return db_query(
-        "SELECT id, name, kind, enabled, embedding_model, length(text) AS chars, created_at FROM sources WHERE notebook_id = ? ORDER BY id ASC",
+        """SELECT s.id, s.name, s.kind, s.enabled, s.embedding_model, length(s.text) AS chars, s.created_at,
+                  COUNT(c.id) AS chunks_count
+           FROM sources s
+           LEFT JOIN chunks c ON s.id = c.source_id
+           WHERE s.notebook_id = ?
+           GROUP BY s.id
+           ORDER BY s.id ASC""",
         (nid,)
     )
 
@@ -481,6 +715,7 @@ def get_source_details(sid: int, user: dict = Depends(current_user)):
     chunks = db_query("SELECT id AS chunk_id, chunk_index, content FROM chunks WHERE source_id = ? ORDER BY chunk_index ASC", (sid,))
     res = dict(src[0])
     res["chunks"] = chunks
+    res["chunks_count"] = len(chunks)
     return res
 
 @app.post("/api/notebooks/{nid}/sources", status_code=201)
@@ -529,6 +764,10 @@ def toggle_source(sid: int, body: EnabledIn, user: dict = Depends(current_user))
 
 @app.delete("/api/sources/{sid}")
 def delete_source(sid: int, user: dict = Depends(current_user)):
+    try:
+        rag_collection.delete(where={"source_id": {"$eq": int(sid)}})
+    except Exception as e:
+        print(f"Chroma delete source notice: {e}")
     db_execute("DELETE FROM sources WHERE id = ?", (sid,))
     return {"ok": True}
 
