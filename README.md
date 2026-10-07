@@ -1,56 +1,40 @@
 # Notebook
 
-A small NotebookLM-style app: add sources (pasted text, PDF/TXT/MD/CSV files, web pages), then ask questions answered from those sources with numbered citations.
+A local NotebookLM app for uploading documents, chatting with them, and viewing source citations.
 
-- **Backend:** FastAPI + SQLite (`backend/main.py`)
-- **Frontend:** plain HTML/CSS/JS in `frontend/` (no build step), served by the backend
-- **Answers:** local TF-IDF passage retrieval. If `OPENAI_API_KEY` is set, the retrieved passages are sent to OpenAI to write the answer.
+- **Backend:** FastAPI + SQLite
+- **Frontend:** HTML, CSS, and JavaScript
+- **Retrieval:** OpenAI embeddings
+- **Answer generation:** OpenAI when an API key is configured
 
 ## Run
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env             # optional: add OPENAI_API_KEY
+cp .env.example .env
 uvicorn backend.main:app --reload
 ```
 
-Open http://127.0.0.1:8000. Interactive API docs: http://127.0.0.1:8000/docs.
+Open http://127.0.0.1:8000.
 
 ## Features
 
-- Multiple notebooks (create, rename, switch, delete); chat history is saved
-- Add sources by paste, file upload/drag-drop, URL import, or web search (DuckDuckGo)
-- Toggle or remove sources; only checked sources are used for answers
-- Citations on every answer
+- Create, rename, switch, and delete notebooks
+- Upload PDF, TXT, Markdown, and CSV files
+- Store document text, chunks, embeddings, chat history, and costs
+- Toggle or remove sources
+- Ask questions with source citations
+- Use OpenAI embeddings when `OPENAI_API_KEY` is provided
 
-## API
+## Configuration
 
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/api/health` | `{ai: bool}` |
-| GET/POST | `/api/notebooks` | list / create |
-| PATCH/DELETE | `/api/notebooks/{id}` | rename / delete |
-| GET/POST | `/api/notebooks/{id}/sources` | list / add pasted text |
-| POST | `/api/notebooks/{id}/sources/upload` | file upload (`file`) |
-| POST | `/api/notebooks/{id}/sources/url` | import a web page `{url}` |
-| PATCH/DELETE | `/api/sources/{id}` | enable toggle `{enabled}` / delete |
-| GET | `/api/web-search?q=` | search results |
-| GET | `/api/notebooks/{id}/messages` | chat history |
-| POST | `/api/notebooks/{id}/chat` | `{question}` → `{answer, citations}` |
+The optional environment variables are:
 
-## Structure
-
-```
-backend/main.py     FastAPI app, SQLite schema, retrieval, API
-frontend/           index.html, style.css, app.js
-requirements.txt  .env.example  .gitignore
+```env
+OPENAI_API_KEY=your_api_key
+OPENAI_MODEL=MODEL_NAME
+DB_PATH=PATH_TO_DB
 ```
 
-## Notes
-
-- Runs on localhost with no login; add authentication before exposing it publicly.
-- URL import blocks private/loopback addresses.
-- Web search scrapes DuckDuckGo's HTML page and may break if that page changes.
-- Set `OPENAI_MODEL` in `.env` to change the model (default `gpt-4o-mini`).

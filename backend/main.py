@@ -1,29 +1,24 @@
 """
-NotebookLM-Style AI Workspace: FastAPI + SQLite + Embeddings + Session Auth + Cost Tracking + In-Doc Citations & API Tools
+NotebookLM AI Workspace: FastAPI + SQLite + Embeddings + Session Auth + Cost Tracking + In-Doc Citations & API Tools
 """
 import collections
-import hashlib
-import hmac
 import io
 import ipaddress
 import json
 import math
 import os
 import re
-import secrets
 import socket
 import sqlite3
 import time
 from contextlib import asynccontextmanager, closing
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
 
 import requests
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from fastapi import Cookie, Depends, FastAPI, File, Header, HTTPException, Query, Response, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -32,7 +27,7 @@ DB = os.environ.get("DB_PATH", "notebook.db")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
-MAX_UPLOAD_BYTES = 16 * 1024 * 1024  # 16 MB
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB
 
 # Pricing constants (USD per token)
 PRICING = {
@@ -46,17 +41,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    salt TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     total_cost REAL DEFAULT 0.0
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
-    token TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS notebooks (
@@ -141,18 +127,23 @@ def db_execute(sql: str, args: tuple = ()):
         c.commit()
         return cur.lastrowid
 
-def hash_password(password: str, salt: Optional[str] = None) -> Tuple[str, str]:
-    if not salt:
-        salt = secrets.token_hex(16)
-    pw_hash = hashlib.sha256((password + salt).encode("utf-8")).hexdigest()
-    return pw_hash, salt
-
-def verify_password(password: str, pw_hash: str, salt: str) -> bool:
-    expected_hash, _ = hash_password(password, salt)
-    return hmac.compare_digest(expected_hash, pw_hash)
-
 def migrate_db(c):
     cur = c.cursor()
+
+    user_cols = [r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
+    if "password_hash" in user_cols or "salt" in user_cols:
+        cur.execute("PRAGMA foreign_keys=OFF")
+        cur.execute("DROP TABLE IF EXISTS sessions")
+        cur.execute("CREATE TABLE users_new (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, total_cost REAL DEFAULT 0.0)")
+        cur.execute(
+            "INSERT INTO users_new(id, username, created_at, total_cost) "
+            "SELECT id, username, created_at, total_cost FROM users"
+        )
+        cur.execute("DROP TABLE users")
+        cur.execute("ALTER TABLE users_new RENAME TO users")
+        cur.execute("PRAGMA foreign_keys=ON")
+        c.commit()
+
     cur.execute("PRAGMA table_info(notebooks)")
     cols = [r[1] for r in cur.fetchall()]
     if "user_id" not in cols:
@@ -183,48 +174,26 @@ def migrate_db(c):
         cur.execute("ALTER TABLE messages ADD COLUMN created_at TIMESTAMP")
     c.commit()
 
-def ensure_default_user():
-    user = db_query("SELECT id FROM users WHERE username = 'demo_user'")
-    if not user:
-        pw_hash, salt = hash_password("demo123")
-        db_execute("INSERT INTO users(username, password_hash, salt) VALUES (?, ?, ?)", ("demo_user", pw_hash, salt))
+def get_demo_user() -> dict:
+    users = db_query("SELECT id, username, total_cost FROM users WHERE username = 'demo_user'")
+    if users:
+        return users[0]
+
+    uid = db_execute("INSERT INTO users(username) VALUES (?)", ("demo_user",))
+    return {"id": uid, "username": "demo_user", "total_cost": 0.0}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     with closing(sqlite3.connect(DB)) as c:
         c.executescript(SCHEMA)
         migrate_db(c)
-    ensure_default_user()
+    get_demo_user()
     yield
 
 app = FastAPI(title="NotebookLM AI App", lifespan=lifespan)
 
-async def get_current_user(
-    authorization: Optional[str] = Header(None),
-    session_token: Optional[str] = Cookie(None)
-) -> dict:
-    token = None
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.split(" ", 1)[1].strip()
-    elif session_token:
-        token = session_token
-
-    if token:
-        sess = db_query("SELECT user_id, expires_at FROM sessions WHERE token = ?", (token,))
-        if sess:
-            expires = datetime.fromisoformat(sess[0]["expires_at"])
-            if expires > datetime.utcnow():
-                users = db_query("SELECT id, username, total_cost FROM users WHERE id = ?", (sess[0]["user_id"],))
-                if users:
-                    return users[0]
-
-    demo = db_query("SELECT id, username, total_cost FROM users WHERE username = 'demo_user'")
-    if demo:
-        return demo[0]
-    
-    pw_hash, salt = hash_password("demo123")
-    uid = db_execute("INSERT INTO users(username, password_hash, salt) VALUES (?, ?, ?)", ("demo_user", pw_hash, salt))
-    return {"id": uid, "username": "demo_user", "total_cost": 0.0}
+def current_user() -> dict:
+    return get_demo_user()
 
 STOPWORDS = set("the a an is are was were of to in on and or for with what how why who when which do does did it this that be as at by from about me my you your tell can i we us they them he she had have has".split())
 
@@ -382,35 +351,7 @@ def execute_attached_api(api_id: int, user_params: Dict[str, Any] = {}) -> Dict[
     except Exception as e:
         return {"api_name": api_info["name"], "error": str(e)}
 
-def safe_url(u: str) -> bool:
-    try:
-        p = urlparse(u)
-        if p.scheme not in ("http", "https") or not p.hostname:
-            return False
-        ip = ipaddress.ip_address(socket.gethostbyname(p.hostname))
-        return not (ip.is_private or ip.is_loopback or ip.is_link_local)
-    except Exception:
-        return False
-
-def fetch_web_page(url: str) -> Tuple[str, str]:
-    if not safe_url(url):
-        raise ValueError("URL is invalid or blocked for security reasons.")
-    res = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0 NotebookLM-App/2.0"})
-    res.raise_for_status()
-    soup = BeautifulSoup(res.text, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "svg"]):
-        tag.decompose()
-    title = (soup.title.string or url).strip() if soup.title else url
-    text = re.sub(r"\n{3,}", "\n\n", soup.get_text("\n")).strip()
-    if len(text) < 40:
-        raise ValueError("No readable text found on that page.")
-    return title[:120], text
-
 # Pydantic models
-class AuthIn(BaseModel):
-    username: str
-    password: str
-
 class NotebookIn(BaseModel):
     title: str = "Untitled notebook"
 
@@ -418,9 +359,6 @@ class TextSourceIn(BaseModel):
     name: str = "Pasted note"
     text: str
     kind: str = "text"
-
-class UrlIn(BaseModel):
-    url: str
 
 class EnabledIn(BaseModel):
     enabled: bool
@@ -438,60 +376,12 @@ class AttachedApiIn(BaseModel):
     description: str = ""
 
 # API Endpoints
-@app.post("/api/auth/register")
-def register(body: AuthIn, response: Response):
-    if len(body.username.strip()) < 3 or len(body.password) < 4:
-        raise HTTPException(400, "Username and password must be at least 3-4 characters.")
-    existing = db_query("SELECT id FROM users WHERE username = ?", (body.username.strip(),))
-    if existing:
-        raise HTTPException(400, "Username is already taken.")
-    pw_hash, salt = hash_password(body.password)
-    uid = db_execute("INSERT INTO users(username, password_hash, salt) VALUES (?, ?, ?)", (body.username.strip(), pw_hash, salt))
-    
-    token = secrets.token_hex(32)
-    expires = datetime.utcnow() + timedelta(days=7)
-    db_execute("INSERT INTO sessions(token, user_id, expires_at) VALUES (?, ?, ?)", (token, uid, expires.isoformat()))
-    response.set_cookie("session_token", token, max_age=7*86400, httponly=True)
-    return {"token": token, "username": body.username.strip(), "user_id": uid}
-
-@app.post("/api/auth/login")
-def login(body: AuthIn, response: Response):
-    users = db_query("SELECT id, username, password_hash, salt, total_cost FROM users WHERE username = ?", (body.username.strip(),))
-    if not users or not verify_password(body.password, users[0]["password_hash"], users[0]["salt"]):
-        raise HTTPException(401, "Invalid username or password.")
-    user = users[0]
-    token = secrets.token_hex(32)
-    expires = datetime.utcnow() + timedelta(days=7)
-    db_execute("INSERT INTO sessions(token, user_id, expires_at) VALUES (?, ?, ?)", (token, user["id"], expires.isoformat()))
-    response.set_cookie("session_token", token, max_age=7*86400, httponly=True)
-    return {"token": token, "username": user["username"], "user_id": user["id"], "total_cost": user["total_cost"]}
-
-@app.post("/api/auth/logout")
-def logout(response: Response, user: dict = Depends(get_current_user)):
-    db_execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],))
-    response.delete_cookie("session_token")
-    return {"ok": True}
-
-@app.get("/api/auth/me")
-def get_me(user: dict = Depends(get_current_user)):
-    recent_costs = db_query("SELECT SUM(cost_usd) as total_spent, SUM(prompt_tokens) as total_p_tokens, SUM(completion_tokens) as total_c_tokens FROM usage_logs WHERE user_id = ?", (user["id"],))
-    spent = (recent_costs[0]["total_spent"] or 0.0) if recent_costs else 0.0
-    return {
-        "user_id": user["id"],
-        "username": user["username"],
-        "total_cost": round(spent, 6),
-        "total_prompt_tokens": (recent_costs[0]["total_p_tokens"] or 0) if recent_costs else 0,
-        "total_completion_tokens": (recent_costs[0]["total_c_tokens"] or 0) if recent_costs else 0,
-        "ai_enabled": bool(OPENAI_KEY),
-        "default_model": OPENAI_MODEL
-    }
-
 @app.get("/api/health")
 def health():
     return {"ai": bool(OPENAI_KEY), "model": OPENAI_MODEL}
 
 @app.get("/api/notebooks")
-def list_notebooks(user: dict = Depends(get_current_user)):
+def list_notebooks(user: dict = Depends(current_user)):
     nbs = db_query("SELECT id, title, created_at FROM notebooks WHERE user_id = ? ORDER BY id DESC", (user["id"],))
     if not nbs:
         nid = db_execute("INSERT INTO notebooks(user_id, title) VALUES (?, ?)", (user["id"], "My Notebook"))
@@ -499,12 +389,12 @@ def list_notebooks(user: dict = Depends(get_current_user)):
     return nbs
 
 @app.post("/api/notebooks", status_code=201)
-def create_notebook(body: NotebookIn, user: dict = Depends(get_current_user)):
+def create_notebook(body: NotebookIn, user: dict = Depends(current_user)):
     nid = db_execute("INSERT INTO notebooks(user_id, title) VALUES (?, ?)", (user["id"], (body.title.strip() or "Untitled notebook")[:120]))
     return {"id": nid, "title": body.title}
 
 @app.get("/api/notebooks/{nid}/cost")
-def get_notebook_cost(nid: int, user: dict = Depends(get_current_user)):
+def get_notebook_cost(nid: int, user: dict = Depends(current_user)):
     costs = db_query(
         "SELECT SUM(cost_usd) as total_cost, SUM(prompt_tokens) as prompt_tokens, SUM(completion_tokens) as completion_tokens, COUNT(id) as total_queries FROM messages WHERE notebook_id = ? AND role = 'assistant'",
         (nid,)
@@ -526,12 +416,12 @@ def get_notebook_cost(nid: int, user: dict = Depends(get_current_user)):
     }
 
 @app.patch("/api/notebooks/{nid}")
-def rename_notebook(nid: int, body: NotebookIn, user: dict = Depends(get_current_user)):
+def rename_notebook(nid: int, body: NotebookIn, user: dict = Depends(current_user)):
     db_execute("UPDATE notebooks SET title = ? WHERE id = ? AND user_id = ?", (body.title.strip()[:120] or "Untitled notebook", nid, user["id"]))
     return {"ok": True}
 
 @app.delete("/api/notebooks/{nid}")
-def delete_notebook(nid: int, user: dict = Depends(get_current_user)):
+def delete_notebook(nid: int, user: dict = Depends(current_user)):
     db_execute("DELETE FROM notebooks WHERE id = ? AND user_id = ?", (nid, user["id"]))
     return {"ok": True}
 
@@ -577,14 +467,14 @@ def store_source_and_index(notebook_id: int, user_id: int, name: str, kind: str,
     }
 
 @app.get("/api/notebooks/{nid}/sources")
-def list_sources(nid: int, user: dict = Depends(get_current_user)):
+def list_sources(nid: int, user: dict = Depends(current_user)):
     return db_query(
         "SELECT id, name, kind, enabled, embedding_model, length(text) AS chars, created_at FROM sources WHERE notebook_id = ? ORDER BY id ASC",
         (nid,)
     )
 
 @app.get("/api/sources/{sid}")
-def get_source_details(sid: int, user: dict = Depends(get_current_user)):
+def get_source_details(sid: int, user: dict = Depends(current_user)):
     src = db_query("SELECT id, notebook_id, name, kind, text, enabled, embedding_model, created_at FROM sources WHERE id = ?", (sid,))
     if not src:
         raise HTTPException(404, "Source not found")
@@ -594,13 +484,13 @@ def get_source_details(sid: int, user: dict = Depends(get_current_user)):
     return res
 
 @app.post("/api/notebooks/{nid}/sources", status_code=201)
-def paste_source(nid: int, body: TextSourceIn, user: dict = Depends(get_current_user)):
+def paste_source(nid: int, body: TextSourceIn, user: dict = Depends(current_user)):
     if not body.text.strip():
         raise HTTPException(400, "Paste some text first.")
     return store_source_and_index(nid, user["id"], body.name or "Pasted note", body.kind or "text", body.text.strip())
 
 @app.post("/api/notebooks/{nid}/sources/upload", status_code=201)
-def upload_source(nid: int, file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+def upload_source(nid: int, file: UploadFile = File(...), user: dict = Depends(current_user)):
     filename = file.filename or "uploaded_file"
     data = file.file.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
@@ -632,47 +522,22 @@ def upload_source(nid: int, file: UploadFile = File(...), user: dict = Depends(g
 
     return store_source_and_index(nid, user["id"], filename, kind, text.strip())
 
-@app.post("/api/notebooks/{nid}/sources/url", status_code=201)
-def url_source(nid: int, body: UrlIn, user: dict = Depends(get_current_user)):
-    try:
-        title, text = fetch_web_page(body.url.strip())
-    except Exception as e:
-        raise HTTPException(400, str(e))
-    return store_source_and_index(nid, user["id"], title, "web", text)
-
 @app.patch("/api/sources/{sid}")
-def toggle_source(sid: int, body: EnabledIn, user: dict = Depends(get_current_user)):
+def toggle_source(sid: int, body: EnabledIn, user: dict = Depends(current_user)):
     db_execute("UPDATE sources SET enabled = ? WHERE id = ?", (1 if body.enabled else 0, sid))
     return {"ok": True}
 
 @app.delete("/api/sources/{sid}")
-def delete_source(sid: int, user: dict = Depends(get_current_user)):
+def delete_source(sid: int, user: dict = Depends(current_user)):
     db_execute("DELETE FROM sources WHERE id = ?", (sid,))
     return {"ok": True}
 
-@app.get("/api/web-search")
-def web_search(query: str = Query("", alias="q")):
-    term = query.strip()
-    if not term:
-        return []
-    try:
-        r = requests.post("https://html.duckduckgo.com/html/", data={"q": term}, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        results = []
-        for a in BeautifulSoup(r.text, "html.parser").select("a.result__a")[:8]:
-            href = a.get("href", "")
-            if "uddg=" in href:
-                href = parse_qs(urlparse(href).query).get("uddg", [href])[0]
-            results.append({"title": a.get_text(strip=True), "url": href})
-        return results
-    except Exception:
-        raise HTTPException(502, "Web search is currently unavailable.")
-
 @app.get("/api/notebooks/{nid}/apis")
-def list_attached_apis(nid: int, user: dict = Depends(get_current_user)):
+def list_attached_apis(nid: int, user: dict = Depends(current_user)):
     return db_query("SELECT id, notebook_id, name, url, method, headers, description, enabled, created_at FROM attached_apis WHERE notebook_id = ?", (nid,))
 
 @app.post("/api/notebooks/{nid}/apis", status_code=201)
-def add_attached_api(nid: int, body: AttachedApiIn, user: dict = Depends(get_current_user)):
+def add_attached_api(nid: int, body: AttachedApiIn, user: dict = Depends(current_user)):
     aid = db_execute(
         "INSERT INTO attached_apis(notebook_id, name, url, method, headers, description, enabled) VALUES (?, ?, ?, ?, ?, ?, 1)",
         (nid, body.name.strip(), body.url.strip(), body.method.upper(), body.headers, body.description)
@@ -680,16 +545,16 @@ def add_attached_api(nid: int, body: AttachedApiIn, user: dict = Depends(get_cur
     return {"id": aid, "name": body.name, "url": body.url}
 
 @app.delete("/api/apis/{aid}")
-def delete_attached_api(aid: int, user: dict = Depends(get_current_user)):
+def delete_attached_api(aid: int, user: dict = Depends(current_user)):
     db_execute("DELETE FROM attached_apis WHERE id = ?", (aid,))
     return {"ok": True}
 
 @app.post("/api/apis/{aid}/test")
-def test_attached_api(aid: int, params: Dict[str, Any] = {}, user: dict = Depends(get_current_user)):
+def test_attached_api(aid: int, params: Dict[str, Any] = {}, user: dict = Depends(current_user)):
     return execute_attached_api(aid, params)
 
 @app.get("/api/notebooks/{nid}/messages")
-def get_messages(nid: int, user: dict = Depends(get_current_user)):
+def get_messages(nid: int, user: dict = Depends(current_user)):
     rows = db_query(
         "SELECT id, role, content, citations, target_source_id, cost_usd, prompt_tokens, completion_tokens, created_at FROM messages WHERE notebook_id = ? ORDER BY id ASC",
         (nid,)
@@ -702,7 +567,7 @@ def get_messages(nid: int, user: dict = Depends(get_current_user)):
     return rows
 
 @app.post("/api/notebooks/{nid}/chat")
-def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(get_current_user)):
+def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(current_user)):
     t0 = time.time()
     question = body.question.strip()
     if not question:
@@ -735,6 +600,7 @@ def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(get_current_u
                 "source_name": hit["source_name"],
                 "chunk_id": hit["chunk_id"],
                 "chunk_index": hit["chunk_index"],
+                "content": hit["content"],
                 "snippet": hit["content"][:160] + "..." if len(hit["content"]) > 160 else hit["content"]
             })
             context_parts.append(f"[{idx}] (Source: {hit['source_name']})\n{hit['content']}")
@@ -842,7 +708,7 @@ def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(get_current_u
     }
 
 @app.get("/api/usage/summary")
-def get_usage_summary(user: dict = Depends(get_current_user)):
+def get_usage_summary(user: dict = Depends(current_user)):
     logs = db_query(
         "SELECT id, operation, model, prompt_tokens, completion_tokens, cost_usd, created_at FROM usage_logs WHERE user_id = ? ORDER BY id DESC LIMIT 25",
         (user["id"],)

@@ -11,10 +11,6 @@ let selectedDocText = "";
 // API Client Helper
 async function api(path, options = {}) {
   const opt = { method: options.method || "GET", headers: {} };
-  const token = localStorage.getItem("nb_token");
-  if (token) {
-    opt.headers["Authorization"] = `Bearer ${token}`;
-  }
   if (options.json !== undefined) {
     opt.method = options.method || "POST";
     opt.headers["Content-Type"] = "application/json";
@@ -196,7 +192,7 @@ function switchToSourcesListView() {
   renderSourcesList();
 }
 
-async function openDocPreviewInLeftBar(sourceId, highlightChunkIndex = null) {
+async function openDocPreviewInLeftBar(sourceId, highlightChunkIndex = null, highlightText = null) {
   currentDocId = sourceId;
   const details = await api(`/sources/${sourceId}`);
 
@@ -218,19 +214,55 @@ async function openDocPreviewInLeftBar(sourceId, highlightChunkIndex = null) {
   }
 
   if (highlightChunkIndex !== null) {
-    jumpAndHighlightChunkInPreview(details.id, highlightChunkIndex);
+    jumpAndHighlightChunkInPreview(details.id, highlightChunkIndex, highlightText);
   }
 }
 
 $("btn-back-to-sources").onclick = switchToSourcesListView;
 
-function jumpAndHighlightChunkInPreview(sourceId, chunkIndex) {
+function jumpAndHighlightChunkInPreview(sourceId, chunkIndex, highlightText = null) {
   const el = $(`chunk-${sourceId}-${chunkIndex}`);
-  if (el) {
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
-    el.classList.add("highlight-pulse");
-    setTimeout(() => el.classList.remove("highlight-pulse"), 3500);
+  if (!el) return;
+
+  const contentEl = el.querySelector(".chunk-text");
+  if (contentEl && highlightText) {
+    const rawText = contentEl.textContent.replace(/\u00a0/g, " ");
+    const normalize = value => value.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+    const normalizedText = normalize(rawText);
+    const normalizedHighlight = normalize(highlightText);
+    const matchIndex = normalizedText.indexOf(normalizedHighlight);
+
+    if (matchIndex >= 0) {
+      let rawStart = 0;
+      let normalizedCount = 0;
+      while (rawStart < rawText.length && normalizedCount < matchIndex) {
+        const char = rawText[rawStart];
+        if (/\s/.test(char) && rawText.slice(rawStart).match(/^\s+/)?.[0]) {
+          const whitespace = rawText.slice(rawStart).match(/^\s+/)[0];
+          rawStart += whitespace.length;
+          normalizedCount += 1;
+        } else {
+          rawStart += char.length;
+          normalizedCount += 1;
+        }
+      }
+
+      const rawEnd = rawStart + normalizedHighlight.length;
+      const before = document.createTextNode(rawText.slice(0, rawStart));
+      const match = document.createElement("mark");
+      match.className = "citation-highlight";
+      match.textContent = rawText.slice(rawStart, rawEnd);
+      const after = document.createTextNode(rawText.slice(rawEnd));
+
+      contentEl.replaceChildren(before, match, after);
+      match.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
   }
+
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.classList.add("highlight-pulse");
+  setTimeout(() => el.classList.remove("highlight-pulse"), 3500);
 }
 
 // Left Source Click
@@ -384,20 +416,53 @@ function renderMessageBubble(role, content, citations = [], meta = {}) {
   const msgDiv = document.createElement("div");
   msgDiv.className = `chat-bubble ${role}`;
 
-  let formattedContent = esc(content);
+  const citationMap = new Map();
+  for (const citation of citations) {
+    citationMap.set(citation.n, citation);
+  }
 
-  // Markdown bold formatting (**text**)
-  formattedContent = formattedContent.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+  const fragment = document.createDocumentFragment();
+  const lines = content.split(/\n/);
 
-  // Replace inline citations like [1], [2] with small inline pill buttons
-  formattedContent = formattedContent.replace(/\[(\d+)\]/g, (match, num) => {
-    return `<button class="cite-pill" data-cite-num="${num}" title="View source [${num}]">[${num}]</button>`;
+  lines.forEach((line, lineIndex) => {
+    if (lineIndex > 0) {
+      fragment.appendChild(document.createElement("br"));
+    }
+
+    let offset = 0;
+    const citationPattern = /\[(\d+)\]/g;
+    let match;
+
+    while ((match = citationPattern.exec(line))) {
+      const textBefore = line.slice(offset, match.index);
+      if (textBefore) {
+        fragment.appendChild(document.createTextNode(textBefore));
+      }
+
+      const num = Number(match[1]);
+      const citation = citationMap.get(num);
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "cite-pill";
+      button.dataset.citeNum = String(num);
+      button.dataset.sourceId = citation ? String(citation.source_id) : "";
+      button.dataset.chunkIndex = citation ? String(citation.chunk_index) : "";
+      button.dataset.citeContent = citation ? citation.content ?? citation.snippet : "";
+      button.title = citation ? `View ${citation.source_name} [${num}]` : `Citation [${num}]`;
+      button.textContent = `[${num}]`;
+      button.disabled = !citation;
+      fragment.appendChild(button);
+
+      offset = match.index + match[0].length;
+    }
+
+    const trailingText = line.slice(offset);
+    if (trailingText) {
+      fragment.appendChild(document.createTextNode(trailingText));
+    }
   });
 
-  // Preserve line breaks
-  formattedContent = formattedContent.replace(/\n\n/g, '<br><br>').replace(/\n/g, '<br>');
-
-  msgDiv.innerHTML = formattedContent;
+  msgDiv.appendChild(fragment);
 
   // Render Query Time & Cost info on assistant messages
   if (role === "assistant" && meta && (meta.cost_usd !== undefined || meta.latency_s !== undefined)) {
@@ -425,18 +490,18 @@ function renderMessageBubble(role, content, citations = [], meta = {}) {
 // Click Citation in Chat -> Open Preview in Left Sidebar & Jump to Chunk
 $("chat-messages").onclick = safeAction(async e => {
   const citeBtn = e.target.closest(".cite-pill");
-  if (citeBtn) {
-    const num = +citeBtn.dataset.citeNum;
-    const msgs = await api(`/notebooks/${currentNotebookId}/messages`);
-    const lastAssistantWithCites = msgs.reverse().find(m => m.role === "assistant" && m.citations && m.citations.length);
-    if (lastAssistantWithCites) {
-      const cite = lastAssistantWithCites.citations.find(c => c.n === num);
-      if (cite) {
-        await openDocPreviewInLeftBar(cite.source_id, cite.chunk_index);
-        showToast(`Jumped to citation [${num}] in ${cite.source_name}`);
-      }
-    }
+  if (!citeBtn) return;
+
+  const sourceId = Number(citeBtn.dataset.sourceId);
+  const chunkIndex = Number(citeBtn.dataset.chunkIndex);
+  const highlightText = citeBtn.dataset.citeContent || null;
+
+  if (!Number.isInteger(sourceId) || !Number.isInteger(chunkIndex)) {
+    throw new Error("Citation metadata is unavailable.");
   }
+
+  await openDocPreviewInLeftBar(sourceId, chunkIndex, highlightText);
+  showToast(`Jumped to citation [${citeBtn.dataset.citeNum}]`);
 });
 
 // Chat Send Handler

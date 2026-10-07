@@ -426,6 +426,14 @@ body {
   box-shadow: 0 0 16px var(--accent-glow);
 }
 
+.citation-highlight {
+  background: #fbbf24;
+  color: #1f2937;
+  border-radius: 3px;
+  padding: 0 2px;
+  box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.5);
+}
+
 /* Floating Toolbar in Document Preview */
 .highlight-toolbar {
   display: none;
