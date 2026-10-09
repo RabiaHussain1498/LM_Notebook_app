@@ -88,7 +88,10 @@
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"></polyline></svg>
               All Sources
             </button>
-            <span class="emb-model-tag" id="doc-emb-tag">emb-3-small</span>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span class="emb-model-tag" id="doc-emb-tag">emb-3-small</span>
+              <button class="source-delete-btn" id="btn-delete-current-doc" title="Delete this source" style="opacity: 0.85; font-size: 0.95rem; padding: 3px 6px;">🗑</button>
+            </div>
           </div>
 
           <h3 class="doc-preview-filename" id="doc-preview-title">Document Name</h3>
@@ -176,10 +179,10 @@
       <div id="drop-zone" class="drop-zone">
         <div class="drop-icon">📄</div>
         <p><strong>Upload sources</strong></p>
-        <p class="drop-hint">PDF, TXT, Markdown, CSV, or Code (.py, .js, .json) up to 16MB</p>
+        <p class="drop-hint">PDF, TXT, Markdown, CSV, Word, PowerPoint, or Code files up to 200 MB</p>
         <label class="btn-browse">
-          Choose file
-          <input type="file" id="file-input" multiple hidden accept=".pdf,.txt,.md,.csv,.tsv,.json,.py,.js,.ts,.html,.css,.sql,.log">
+          Choose files
+          <input type="file" id="file-input" multiple hidden accept=".pdf,.txt,.md,.csv,.tsv,.json,.doc,.docx,.ppt,.pptx,.py,.js,.ts,.html,.css,.sql,.log">
         </label>
       </div>
 

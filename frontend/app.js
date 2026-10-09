@@ -170,7 +170,7 @@ function renderSourcesList() {
     return;
   }
 
-  listEl.innerHTML = sources.map(s => {
+  const renderSource = s => {
     const icon = getKindIcon(s.kind);
     const isSelected = currentDocId === s.id ? "selected-reading" : "";
     const chunks = s.chunks_count !== undefined ? s.chunks_count : 0;
@@ -190,10 +190,32 @@ function renderSourcesList() {
             ${costLabel}
           </div>
         </div>
+        <button class="source-delete-btn" data-id="${s.id}" title="Delete source">🗑</button>
         <input type="checkbox" class="source-checkbox" data-id="${s.id}" ${s.enabled ? "checked" : ""} onclick="event.stopPropagation()">
       </div>
     `;
-  }).join("");
+  };
+
+  const ungroupedSources = sources.filter(s => !s.folder_path);
+  const folderGroups = new Map();
+  sources.filter(s => s.folder_path).forEach(source => {
+    if (!folderGroups.has(source.folder_path)) folderGroups.set(source.folder_path, []);
+    folderGroups.get(source.folder_path).push(source);
+  });
+
+  listEl.innerHTML = [
+    ...ungroupedSources.map(renderSource),
+    ...Array.from(folderGroups, ([folderPath, folderSources]) => `
+      <details class="source-folder-group" open>
+        <summary class="source-folder-heading">
+          <span class="source-folder-icon">📁</span>
+          <span class="source-folder-name" title="${esc(folderPath)}">${esc(folderPath)}</span>
+          <span class="source-folder-count">${folderSources.length}</span>
+        </summary>
+        <div class="source-folder-files">${folderSources.map(renderSource).join("")}</div>
+      </details>
+    `)
+  ].join("");
 }
 
 // Switching views inside Left Sidebar
@@ -231,27 +253,46 @@ async function openDocPreviewInLeftBar(sourceId, highlightText = null) {
 
 $("btn-back-to-sources").onclick = switchToSourcesListView;
 
+const btnDelPreview = $("btn-delete-current-doc");
+if (btnDelPreview) {
+  btnDelPreview.onclick = safeAction(async () => {
+    if (!currentDocId) return;
+    const src = sources.find(s => s.id === currentDocId);
+    const name = src ? src.name : "this source";
+    if (!confirm(`Delete "${name}"? This cannot be undone.`)) return;
+    const idToDelete = currentDocId;
+    await api(`/sources/${idToDelete}`, { method: "DELETE" });
+    switchToSourcesListView();
+    await refreshSources();
+    await updateNotebookTotalCost();
+    showToast("Source deleted.");
+  });
+}
+
 // Search the full original document text and highlight the matching passage
 function highlightInDocument(sourceId, highlightText) {
   const container = $(`doc-full-text-${sourceId}`);
   if (!container || !highlightText) return;
 
   const rawText = container.textContent;
-  const collapseWS = s => s.replace(/[\u00a0\s]+/g, " ").trim();
+  const collapseWS = s => s.replace(/[\u00a0\s]+/g, " ").replace(/[""]/g, '"').replace(/['']/g, "'").trim();
   const normalizedRaw = collapseWS(rawText);
 
   // Strip any residual [Header] prefix old chunker stored at chunk start
   const cleanHL = highlightText.replace(/^\[[\s\S]*?\]\s*/, '').trim();
+  const withoutListNumber = cleanHL.replace(/^\d+[\.\)]\s*/, '').trim();
 
   // Multi-strategy search: most specific → least specific
   const strategies = [
     collapseWS(cleanHL),                                               // 1. full chunk
-    cleanHL.length > 100 ? collapseWS(cleanHL.slice(0, 300)) : null,  // 2. first 300 chars
-    cleanHL.length > 200                                               // 3. middle 200-char window
-      ? collapseWS(cleanHL.slice(Math.floor(cleanHL.length * 0.2), Math.floor(cleanHL.length * 0.2) + 200))
+    withoutListNumber !== cleanHL ? collapseWS(withoutListNumber) : null, // 2. without list number (e.g. "3. ")
+    cleanHL.length > 80 ? collapseWS(cleanHL.slice(0, 250)) : null,    // 3. first 250 chars
+    withoutListNumber.length > 80 ? collapseWS(withoutListNumber.slice(0, 250)) : null, // 4. first 250 chars of body
+    cleanHL.length > 150                                               // 5. middle 150-char window
+      ? collapseWS(cleanHL.slice(Math.floor(cleanHL.length * 0.2), Math.floor(cleanHL.length * 0.2) + 150))
       : null,
-    (cleanHL.match(/^.{20,}?[.!?]/s) || [cleanHL.slice(0, 100)])[0]   // 4. first sentence
-      ? collapseWS((cleanHL.match(/^.{20,}?[.!?]/s) || [cleanHL.slice(0, 100)])[0])
+    (cleanHL.match(/^.{20,}?[.!?]/s) || [cleanHL.slice(0, 80)])[0]    // 6. first sentence
+      ? collapseWS((cleanHL.match(/^.{20,}?[.!?]/s) || [cleanHL.slice(0, 80)])[0])
       : null,
   ].filter(Boolean);
 
@@ -301,6 +342,21 @@ function highlightInDocument(sourceId, highlightText) {
 
 // Left Source Click
 $("source-list").onclick = safeAction(async e => {
+  // Handle delete button click
+  const delBtn = e.target.closest(".source-delete-btn");
+  if (delBtn) {
+    const srcId = +delBtn.dataset.id;
+    const src = sources.find(s => s.id === srcId);
+    const name = src ? src.name : "this source";
+    if (!confirm(`Delete "${name}"? This cannot be undone.`)) return;
+    await api(`/sources/${srcId}`, { method: "DELETE" });
+    if (currentDocId === srcId) switchToSourcesListView();
+    await refreshSources();
+    await updateNotebookTotalCost();
+    showToast("Source deleted.");
+    return;
+  }
+
   const row = e.target.closest(".source-item-row");
   if (row && !e.target.classList.contains("source-checkbox")) {
     const srcId = +row.dataset.id;
@@ -347,12 +403,17 @@ $("btn-save-paste").onclick = safeAction(async () => {
 });
 
 const handleUploadFiles = safeAction(async files => {
+  files = Array.from(files);
+  if (!files.length) return;
   addDlg.close();
   let totalChunks = 0;
   for (const f of files) {
     showToast(`Uploading ${f.name}...`);
     const fd = new FormData();
     fd.append("file", f);
+    const relativePath = f.webkitRelativePath || "";
+    const slashIndex = relativePath.lastIndexOf("/");
+    if (slashIndex > 0) fd.append("folder_path", relativePath.slice(0, slashIndex));
     const res = await api(`/notebooks/${currentNotebookId}/sources/upload`, { form: fd });
     totalChunks += res.chunks_count || 0;
   }
@@ -361,7 +422,11 @@ const handleUploadFiles = safeAction(async files => {
   showToast(`Uploaded & indexed — ${totalChunks} chunk${totalChunks === 1 ? "" : "s"}`);
 });
 
-$("file-input").onchange = e => handleUploadFiles(e.target.files);
+$("file-input").onchange = e => {
+  handleUploadFiles(e.target.files);
+  e.target.value = "";
+};
+
 
 const dropZone = $("drop-zone");
 ["dragover", "dragenter"].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.add("dragover"); }));
@@ -477,6 +542,8 @@ function renderMessageBubble(role, content, citations = [], meta = {}) {
       }
 
       const num = Number(match[1]);
+      offset = match.index + match[0].length;
+
       const citation = citationMap.get(num);
       const button = document.createElement("button");
       button.type = "button";
@@ -485,12 +552,37 @@ function renderMessageBubble(role, content, citations = [], meta = {}) {
       button.dataset.sourceId = citation ? String(citation.source_id) : "";
       button.dataset.chunkIndex = citation ? String(citation.chunk_index) : "";
       button.dataset.citeContent = citation ? citation.content ?? citation.snippet : "";
-      button.title = citation ? `View ${citation.source_name} [${num}]` : `Citation [${num}]`;
+      button.title = "";  // clear native title; we use custom tooltip
       button.textContent = `[${num}]`;
       button.disabled = !citation;
-      fragment.appendChild(button);
 
-      offset = match.index + match[0].length;
+      // Add hover tooltip with citation content preview
+      if (citation) {
+        const tooltip = document.createElement("span");
+        tooltip.className = "cite-tooltip";
+
+        const citeContent = (citation.content ?? citation.snippet ?? "").trim();
+        const sourceName = citation.source_name || "";
+
+        if (sourceName) {
+          const sourceLabel = document.createElement("span");
+          sourceLabel.className = "cite-tooltip-source";
+          sourceLabel.textContent = `📄 ${sourceName}`;
+          tooltip.appendChild(sourceLabel);
+        }
+
+        const preview = citeContent.length > 200
+          ? citeContent.slice(0, 200) + "…"
+          : citeContent;
+        const contentNode = document.createTextNode(preview || "No preview available");
+        tooltip.appendChild(contentNode);
+
+        button.textContent = "";
+        button.appendChild(document.createTextNode(`[${num}]`));
+        button.appendChild(tooltip);
+      }
+
+      fragment.appendChild(button);
     }
 
     const trailingText = line.slice(offset);

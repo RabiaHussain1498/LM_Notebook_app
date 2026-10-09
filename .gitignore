@@ -7,3 +7,5 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+chroma_db/
+

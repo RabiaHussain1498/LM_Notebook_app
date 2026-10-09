@@ -20,14 +20,14 @@ import chromadb
 from chromadb.config import Settings
 import requests
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 load_dotenv()
 DB = os.environ.get("DB_PATH", "notebook.db")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-6-luna").strip()
 CHROMA_DIR = os.environ.get("CHROMA_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "chroma_db"))
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB
@@ -42,6 +42,7 @@ rag_collection = chroma_client.get_or_create_collection(
 # Pricing constants (USD per token)
 PRICING = {
     "gpt-4o-mini": {"input": 0.150 / 1_000_000, "output": 0.600 / 1_000_000},
+    "gpt-6-luna": {"input": 0.100 / 1_000_000, "output": 0.500 / 1_000_000},
     "gpt-4o": {"input": 2.500 / 1_000_000, "output": 10.000 / 1_000_000},
     "text-embedding-3-small": {"input": 0.020 / 1_000_000, "output": 0.0},
     "text-embedding-3-large": {"input": 0.130 / 1_000_000, "output": 0.0},
@@ -71,6 +72,7 @@ CREATE TABLE IF NOT EXISTS sources (
     enabled INTEGER NOT NULL DEFAULT 1,
     embedding_model TEXT DEFAULT 'tf-idf-local',
     embedding_cost REAL DEFAULT 0.0,
+    folder_path TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -168,6 +170,8 @@ def migrate_db(c):
         cur.execute("ALTER TABLE sources ADD COLUMN embedding_model TEXT DEFAULT 'tf-idf-local'")
     if "embedding_cost" not in cols:
         cur.execute("ALTER TABLE sources ADD COLUMN embedding_cost REAL DEFAULT 0.0")
+    if "folder_path" not in cols:
+        cur.execute("ALTER TABLE sources ADD COLUMN folder_path TEXT NOT NULL DEFAULT ''")
     if "created_at" not in cols:
         cur.execute("ALTER TABLE sources ADD COLUMN created_at TIMESTAMP")
 
@@ -271,17 +275,20 @@ STOPWORDS = set("the a an is are was were of to in on and or for with what how w
 def clean_pdf_text(text: str) -> str:
     """
     Fix common pypdf extraction artifacts:
+    - Normalize non-breaking spaces (\xa0) and unicode spaces
     - Dehyphenate broken words across lines (impres-\nsive -> impressive)
-    - Collapse multiple spaces to single space
+    - Remove standalone watermark / ebook footer lines
     - Remove isolated page numbers
     - Normalize unicode dashes and quotes
     """
+    text = text.replace("\xa0", " ").replace("\u200b", "")
     # Merge hyphenated line-breaks: "impres-\nsive" -> "impressive"
     text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
-    # Remove lines that are just page numbers (1-4 digits alone on a line)
-    text = re.sub(r"\n\s*\d{1,4}\s*\n", "\n", text)
-    # Collapse multiple spaces (but not newlines)
-    text = re.sub(r"[^\S\n]+", " ", text)
+    # Remove standalone watermark / ebook URL / footer lines
+    text = re.sub(r"(?m)^\s*(?:www\.[a-z0-9\-]+\.[a-z]{2,4}|page\s*\d+|\d{1,4})\s*$", "", text)
+    # Collapse small runs of 2-3 spaces (extraction artifacts) but preserve
+    # 4+ space runs (table column alignment) and tabs
+    text = re.sub(r"(?<!\S)[ ]{2,3}(?!\S[ ])", " ", text)
     # Normalize dashes and quotes to ASCII
     text = text.replace("\u2013", "-").replace("\u2014", "-")
     text = text.replace("\u201c", '"').replace("\u201d", '"')
@@ -290,63 +297,64 @@ def clean_pdf_text(text: str) -> str:
     text = "\n".join(line.rstrip() for line in text.split("\n"))
     return text.strip()
 
+def is_heading_or_section_start(text: str) -> bool:
+    first_line = text.split("\n")[0].strip()
+    if re.match(r"^(#{1,6}\s+|[A-Z][A-Za-z0-9\s]{1,40}:|\d+[\.\)]\s+|(?:Q|Question|Checkpoint|Exercise|Problem|Task|Day|Part|Section|Chapter|About|To\s+my|Author|Copyright|Dedication|Introduction|Conclusion|References)\b)", first_line, re.I):
+        return True
+    if len(first_line) < 45 and re.match(r"^[A-Z][a-z]+(?:\s+[A-Za-z0-9\(\)]+){0,5}$", first_line):
+        return True
+    return False
+
 def tokenize(text: str) -> List[str]:
     return [w for w in re.findall(r"[a-z0-9']+", text.lower()) if w not in STOPWORDS and len(w) > 1]
 
 def chunk_markdown_or_text(text: str, target_size: int = 600, overlap: int = 0) -> List[str]:
     """
-    Clean Paragraph + Sentence Chunking for Prose, PDFs, Markdown:
-    - Splits on section boundaries (headers) and paragraph breaks.
-    - Splits large paragraphs on sentence boundaries.
-    - NO overlap injected into stored chunk content (overlap caused broken display
-      and prevented highlight search from matching chunks back to original text).
-    - NO [Header] prefix prepended (caused indexOf search failure in frontend).
-    - Chunks are clean, contiguous substrings of the original text.
+    Clean Semantic + Structural Chunking for Prose, PDFs, Markdown:
+    - Splits on section boundaries, markdown headers, questions, numbered lists, bullet points, and paragraph breaks.
+    - Preserves logical units (e.g., individual questions/answers, dedications, bios, or list items) intact.
+    - If a unit starts with a heading or represents an independent block, it forms its own clean chunk.
+    - If an individual unit exceeds target_size, splits strictly on sentence boundaries.
     """
     normalized = re.sub(r"\r\n|\r", "\n", text).strip()
     if not normalized:
         return []
 
-    lines = normalized.split("\n")
-    sections = []
-    current_block: List[str] = []
-
-    for line in lines:
-        # Detect section headers: # Markdown headers or ALL-CAPS: labels
-        if re.match(r"^(#{1,6}\s+.+|[A-Z][A-Z0-9\s]{2,38}:)$", line.strip()):
-            if current_block:
-                sections.append("\n".join(current_block))
-                current_block = []
-        current_block.append(line)
-
-    if current_block:
-        sections.append("\n".join(current_block))
+    pattern = r"\n\s*\n|\n(?=(?:(?:\d+|[a-zA-Z])[\.\)]\s+|(?:Q|Question|Checkpoint|Exercise|Problem|Task|Day|Part|Section|Chapter|About|To\s+my|Author|Dedication|Introduction|Conclusion)\b|#{1,6}\s+|[-*•]\s+|[A-Z][A-Za-z0-9\s]{1,35}:|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,4}\s*\n))"
+    units = [u.strip() for u in re.split(pattern, normalized) if u.strip()]
 
     chunks_out: List[str] = []
+    current_chunk = ""
 
-    for content in sections:
-        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", content) if p.strip()]
+    for unit in units:
+        is_header = is_heading_or_section_start(unit)
 
-        current_chunk = ""
-        for para in paragraphs:
-            if len(para) > target_size:
-                # Split large paragraph by sentences
-                sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", para) if s.strip()]
-                for sentence in sentences:
-                    if current_chunk and len(current_chunk) + 1 + len(sentence) > target_size:
-                        chunks_out.append(current_chunk.strip())
-                        current_chunk = sentence          # clean start, no overlap
-                    else:
-                        current_chunk += (" " if current_chunk else "") + sentence
-            else:
-                if current_chunk and len(current_chunk) + 2 + len(para) > target_size:
-                    chunks_out.append(current_chunk.strip())
-                    current_chunk = para                  # clean start, no overlap
-                else:
-                    current_chunk += ("\n\n" if current_chunk else "") + para
-
-        if current_chunk.strip():
+        # Flush previous chunk if this unit is a distinct section or header
+        if is_header and current_chunk:
             chunks_out.append(current_chunk.strip())
+            current_chunk = ""
+
+        if len(unit) > target_size:
+            if current_chunk:
+                chunks_out.append(current_chunk.strip())
+                current_chunk = ""
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", unit) if s.strip()]
+            for sentence in sentences:
+                if current_chunk and len(current_chunk) + 1 + len(sentence) > target_size:
+                    chunks_out.append(current_chunk.strip())
+                    current_chunk = sentence
+                else:
+                    current_chunk += ("\n\n" if current_chunk else "") + sentence
+        else:
+            # If current_chunk has substantial content (> 220 chars) or adding unit exceeds target_size, flush
+            if current_chunk and (len(current_chunk) > 220 or len(current_chunk) + 2 + len(unit) > target_size):
+                chunks_out.append(current_chunk.strip())
+                current_chunk = unit
+            else:
+                current_chunk += ("\n\n" if current_chunk else "") + unit
+
+    if current_chunk.strip():
+        chunks_out.append(current_chunk.strip())
 
     return chunks_out or [normalized[:target_size]]
 
@@ -420,8 +428,6 @@ def chunk_text(text: str, kind: str = "text", size: int = 550, overlap: int = 70
 def select_embedding_model(kind: str, text: str) -> str:
     if not OPENAI_KEY:
         return "tf-idf-local"
-    if kind in ("code", "table") or len(text) > 20000:
-        return "text-embedding-3-large"
     return "text-embedding-3-small"
 
 def compute_openai_embedding(texts: List[str], model: str) -> Tuple[List[List[float]], int, float]:
@@ -649,11 +655,18 @@ def delete_notebook(nid: int, user: dict = Depends(current_user)):
     db_execute("DELETE FROM notebooks WHERE id = ? AND user_id = ?", (nid, user["id"]))
     return {"ok": True}
 
-def store_source_and_index(notebook_id: int, user_id: int, name: str, kind: str, text: str) -> Dict[str, Any]:
+def store_source_and_index(
+    notebook_id: int,
+    user_id: int,
+    name: str,
+    kind: str,
+    text: str,
+    folder_path: str = "",
+) -> Dict[str, Any]:
     emb_model = select_embedding_model(kind, text)
     sid = db_execute(
-        "INSERT INTO sources(notebook_id, name, kind, text, enabled, embedding_model, embedding_cost) VALUES (?, ?, ?, ?, 1, ?, 0.0)",
-        (notebook_id, name[:140], kind, text, emb_model)
+        "INSERT INTO sources(notebook_id, name, kind, text, enabled, embedding_model, embedding_cost, folder_path) VALUES (?, ?, ?, ?, 1, ?, 0.0, ?)",
+        (notebook_id, name[:140], kind, text, emb_model, folder_path)
     )
     raw_chunks = chunk_text(text, kind=kind)
     embeddings = []
@@ -718,14 +731,15 @@ def store_source_and_index(notebook_id: int, user_id: int, name: str, kind: str,
         "chars": len(text),
         "chunks_count": len(raw_chunks),
         "embedding_model": emb_model,
-        "embedding_cost": emb_cost
+        "embedding_cost": emb_cost,
+        "folder_path": folder_path
     }
 
 @app.get("/api/notebooks/{nid}/sources")
 def list_sources(nid: int, user: dict = Depends(current_user)):
     check_notebook_owner(nid, user["id"])
     return db_query(
-        """SELECT s.id, s.name, s.kind, s.enabled, s.embedding_model,
+        """SELECT s.id, s.name, s.kind, s.enabled, s.embedding_model, s.folder_path,
                   length(s.text) AS chars, s.created_at,
                   COALESCE(s.embedding_cost, 0.0) AS embedding_cost,
                   COUNT(c.id) AS chunks_count
@@ -754,9 +768,21 @@ def paste_source(nid: int, body: TextSourceIn, user: dict = Depends(current_user
     return store_source_and_index(nid, user["id"], body.name or "Pasted note", body.kind or "text", body.text.strip())
 
 @app.post("/api/notebooks/{nid}/sources/upload", status_code=201)
-def upload_source(nid: int, file: UploadFile = File(...), user: dict = Depends(current_user)):
+def upload_source(
+    nid: int,
+    file: UploadFile = File(...),
+    folder_path: str = Form(""),
+    user: dict = Depends(current_user),
+):
     check_notebook_owner(nid, user["id"])
-    filename = file.filename or "uploaded_file"
+    filename = (file.filename or "uploaded_file").replace("\\", "/").rsplit("/", 1)[-1]
+    folder_parts = [
+        part for part in folder_path.replace("\\", "/").split("/")
+        if part not in ("", ".")
+    ]
+    if any(part == ".." for part in folder_parts):
+        raise HTTPException(400, "Invalid folder path.")
+    normalized_folder_path = "/".join(folder_parts)[:500]
     data = file.file.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, "File exceeds maximum size of 200 MB.")
@@ -786,7 +812,9 @@ def upload_source(nid: int, file: UploadFile = File(...), user: dict = Depends(c
     if not text.strip():
         raise HTTPException(400, "Could not extract readable text from that file.")
 
-    return store_source_and_index(nid, user["id"], filename, kind, text.strip())
+    return store_source_and_index(
+        nid, user["id"], filename, kind, text.strip(), normalized_folder_path
+    )
 
 @app.patch("/api/sources/{sid}")
 def toggle_source(sid: int, body: EnabledIn, user: dict = Depends(current_user)):
@@ -818,6 +846,42 @@ def get_messages(nid: int, user: dict = Depends(current_user)):
             r["citations"] = []
     return rows
 
+# Safety Guardrails
+SELF_HARM_REGEX = re.compile(
+    r"\b(suicide|suicidal|kill\s+(?:my\s*self|me)|end\s+my\s+life|self\s*harm|cutting\s+(?:my\s*self|me)|hang\s+(?:my\s*self|me)|want\s+to\s+die|how\s+to\s+die|commit\s+suicide|take\s+my\s+own\s+life)\b",
+    re.IGNORECASE
+)
+
+VIOLENCE_HARM_REGEX = re.compile(
+    r"\b(murder|assassinate|assassination|massacre|terrorist|terrorism|how\s+to\s+kill|ways\s+to\s+kill|instructions?\s+to\s+kill|kill\s+(?:someone|somebody|a\s+person|people|others|anyone)|hire\s+a\s+hitman|how\s+to\s+make\s+a\s+bomb|manufacture\s+explosives|school\s+shooting|build\s+a\s+weapon|poison\s+(?:someone|somebody|a\s+person|people))\b",
+    re.IGNORECASE
+)
+
+# Conversational Queries (Greetings / Identity)
+GREETING_REGEX = re.compile(
+    r"^\s*(hi|hy|hello|hey|heyy|greetings|good\s+morning|good\s+afternoon|good\s+evening|howdy|sup|yo|hola)\b[!\?.,\s]*$",
+    re.IGNORECASE
+)
+
+CAPABILITY_REGEX = re.compile(
+    r"^\s*(who\s+are\s+you|what\s+are\s+you|what\s+can\s+you\s+do|how\s+can\s+you\s+help|what\s+is\s+this\s+app|help\s*me|how\s+does\s+this\s+work|what\s+is\s+notebooklm)\b[!\?.,\s]*$",
+    re.IGNORECASE
+)
+
+def normalize_citation_tags(text: str) -> str:
+    """Expand citation ranges and lists like [1]–[2] or [1, 2] to standard [1] [2]"""
+    def expand_range(match):
+        start = int(match.group(1))
+        end = int(match.group(2))
+        if 1 <= start <= end and end - start <= 10:
+            return " ".join(f"[{i}]" for i in range(start, end + 1))
+        return match.group(0)
+
+    text = re.sub(r"\[(\d+)\s*[-–—]\s*(\d+)\]", expand_range, text)
+    text = re.sub(r"\[(\d+)\]\s*[-–—]\s*\[(\d+)\]", expand_range, text)
+    text = re.sub(r"\[(\d+(?:\s*,\s*\d+)+)\]", lambda m: " ".join(f"[{x.strip()}]" for x in m.group(1).split(",")), text)
+    return text
+
 @app.post("/api/notebooks/{nid}/chat")
 def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(current_user)):
     check_notebook_owner(nid, user["id"])
@@ -826,102 +890,172 @@ def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(current_user)
     if not question:
         raise HTTPException(400, "Please enter a question.")
 
-    hits, strategy, ret_cost = retrieve_top_chunks(
-        notebook_id=nid,
-        query=question,
-        target_source_id=body.target_source_id,
-        k=5
-    )
-
-    if not hits and not body.highlighted_context:
-        answer = "I couldn't find relevant content in your selected source(s). Try selecting another document or adding more notes."
+    # 1. Safety Guardrail: Self-harm / Suicide
+    if SELF_HARM_REGEX.search(question):
+        answer = (
+            "If you or someone you know is going through a difficult time or having thoughts of self-harm or suicide, "
+            "please know that you are not alone and support is available:\n\n"
+            "• **In the US & Canada:** Call or text **988** (Suicide & Crisis Lifeline)\n"
+            "• **In the UK:** Call **111** or text **SHOUT** to **85258**\n"
+            "• **International Resources:** Visit [befrienders.org](https://www.befrienders.org) or [iasp.info/resources/Crisis_Centres](https://www.iasp.info/resources/Crisis_Centres/)\n\n"
+            "Please reach out to a trusted person, counselor, or emergency services."
+        )
         citations = []
         cost_usd = 0.0
         prompt_tok = 0
         comp_tok = 0
+        strategy = "safety-guardrail"
+
+    # 2. Safety Guardrail: Violence / Harm / Illegal Acts
+    elif VIOLENCE_HARM_REGEX.search(question):
+        answer = (
+            "I cannot fulfill this request. I am designed to assist with research and note analysis, "
+            "and I cannot generate content or provide guidance related to violence, murder, self-harm, or illegal acts."
+        )
+        citations = []
+        cost_usd = 0.0
+        prompt_tok = 0
+        comp_tok = 0
+        strategy = "safety-guardrail"
+
+    # 3. Conversational Queries: Greetings
+    elif GREETING_REGEX.match(question):
+        answer = "Hello! How can I help you with your notes and research today? You can select documents on the left and ask questions, generate summaries, or explore specific topics."
+        citations = []
+        cost_usd = 0.0
+        prompt_tok = 0
+        comp_tok = 0
+        strategy = "conversational-greeting"
+
+    # 4. Conversational Queries: Identity & Capabilities
+    elif CAPABILITY_REGEX.match(question):
+        answer = (
+            "I am your NotebookLM AI assistant! I help you analyze, search, and synthesize information from your uploaded sources and notes.\n\n"
+            "Here is what you can do:\n"
+            "• **Upload Documents**: Add PDFs, Markdown, Word, PowerPoint, Code, or Text files in the left sidebar.\n"
+            "• **Ask Questions**: Ask anything grounded in your documents with precise source citations.\n"
+            "• **Highlight & Jump**: Click on any citation to open and highlight the exact passage in your document."
+        )
+        citations = []
+        cost_usd = 0.0
+        prompt_tok = 0
+        comp_tok = 0
+        strategy = "conversational-capability"
+
+    # 5. Standard RAG Research Query
     else:
-        raw_citations = []
-        context_parts = []
+        hits, strategy, ret_cost = retrieve_top_chunks(
+            notebook_id=nid,
+            query=question,
+            target_source_id=body.target_source_id,
+            k=5
+        )
 
-        if body.highlighted_context:
-            context_parts.append(f"[Selection] Highlighted passage from document:\n{body.highlighted_context}")
-
-        for idx, hit in enumerate(hits, 1):
-            raw_citations.append({
-                "n": idx,
-                "source_id": hit["source_id"],
-                "source_name": hit["source_name"],
-                "chunk_id": hit["chunk_id"],
-                "chunk_index": hit["chunk_index"],
-                "content": hit["content"],
-                "snippet": hit["content"][:160] + "..." if len(hit["content"]) > 160 else hit["content"]
-            })
-            context_parts.append(f"[{idx}] (Source: {hit['source_name']})\n{hit['content']}")
-
-        context_str = "\n\n".join(context_parts)
-
-        if OPENAI_KEY:
-            from openai import OpenAI
-            client = OpenAI(api_key=OPENAI_KEY)
-
-            history_rows = db_query(
-                "SELECT role, content FROM messages WHERE notebook_id = ? ORDER BY id DESC LIMIT 6",
-                (nid,)
-            )[::-1]
-
-            system_prompt = (
-                "You are an AI research assistant. Your task is to answer questions strictly and accurately using the provided numbered sources.\n"
-                "Format citations inline using square brackets like [1], [2] next to every claim or quote.\n"
-                "If the sources do not contain the answer, explicitly state that the documents don't provide sufficient information.\n"
-            )
-
-            messages_payload = [
-                {"role": "system", "content": system_prompt},
-                *[{"role": m["role"], "content": m["content"]} for m in history_rows],
-                {"role": "user", "content": f"Document Sources:\n{context_str}\n\nQuestion: {question}"}
-            ]
-
-            try:
-                chat_res = client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=messages_payload,
-                    temperature=0.2
-                )
-                answer = chat_res.choices[0].message.content
-                prompt_tok = chat_res.usage.prompt_tokens
-                comp_tok = chat_res.usage.completion_tokens
-                
-                p_rates = PRICING.get(OPENAI_MODEL, PRICING["gpt-4o-mini"])
-                cost_usd = (prompt_tok * p_rates["input"]) + (comp_tok * p_rates["output"]) + ret_cost
-
-                # Automatically re-index citations sequentially (e.g. [1],[2],[4] -> [1],[2],[3])
-                old_to_new = {}
-                used_citations = []
-                for m in re.finditer(r"\[(\d+)\]", answer):
-                    old_n = int(m.group(1))
-                    if old_n not in old_to_new and 1 <= old_n <= len(raw_citations):
-                        new_n = len(old_to_new) + 1
-                        old_to_new[old_n] = new_n
-                        orig = raw_citations[old_n - 1].copy()
-                        orig["n"] = new_n
-                        used_citations.append(orig)
-
-                if old_to_new:
-                    answer = re.sub(r"\[(\d+)\]", lambda m: f"[{old_to_new.get(int(m.group(1)), m.group(1))}]", answer)
-                    citations = used_citations
-                else:
-                    citations = raw_citations
-
-            except Exception as e:
-                raise HTTPException(502, f"OpenAI generation failed: {e}")
-        else:
+        if not hits and not body.highlighted_context:
+            answer = "I couldn't find relevant content in your selected source(s). Try selecting another document or adding more notes."
+            citations = []
             cost_usd = 0.0
             prompt_tok = 0
             comp_tok = 0
-            citations = raw_citations
-            answer = "### Matching Passages (Local Mode):\n\n" + "\n\n".join(
-                f"**[{c['n']}] {c['source_name']}:**\n> {hits[i]['content']}" for i, c in enumerate(citations)
-            )
+        else:
+            raw_citations = []
+            context_parts = []
+
+            if body.highlighted_context:
+                context_parts.append(f"[Selection] Highlighted passage from document:\n{body.highlighted_context}")
+
+            for idx, hit in enumerate(hits, 1):
+                raw_citations.append({
+                    "n": idx,
+                    "source_id": hit["source_id"],
+                    "source_name": hit["source_name"],
+                    "chunk_id": hit["chunk_id"],
+                    "chunk_index": hit["chunk_index"],
+                    "content": hit["content"],
+                    "snippet": hit["content"][:160] + "..." if len(hit["content"]) > 160 else hit["content"]
+                })
+                context_parts.append(f"[{idx}] (Source: {hit['source_name']})\n{hit['content']}")
+
+            context_str = "\n\n".join(context_parts)
+
+            if OPENAI_KEY:
+                from openai import OpenAI
+                client = OpenAI(api_key=OPENAI_KEY)
+
+                history_rows = db_query(
+                    "SELECT role, content FROM messages WHERE notebook_id = ? ORDER BY id DESC LIMIT 6",
+                    (nid,)
+                )[::-1]
+
+                system_prompt = (
+                    "You are an AI research assistant. Your task is to answer questions strictly, clearly, and accurately using the provided numbered document sources.\n"
+                    "Citation Rules:\n"
+                    "- Format citations inline using square brackets like [1] or [2] immediately following each specific claim or quote.\n"
+                    "- Always cite individual sources separately (e.g. write '[1] [2]', NEVER combine into ranges like '[1-2]').\n"
+                    "- Only reference a source number [N] if the fact is directly supported by that specific document snippet.\n"
+                    "- If the provided sources do not contain sufficient information to answer the question, clearly state that the sources do not provide the information."
+                )
+
+                messages_payload = [
+                    {"role": "system", "content": system_prompt},
+                    *[{"role": m["role"], "content": m["content"]} for m in history_rows],
+                    {"role": "user", "content": f"Document Sources:\n{context_str}\n\nQuestion: {question}"}
+                ]
+
+                try:
+                    chat_kwargs = {
+                        "model": OPENAI_MODEL,
+                        "messages": messages_payload,
+                    }
+                    if not (OPENAI_MODEL.startswith("o1") or OPENAI_MODEL.startswith("o3") or "luna" in OPENAI_MODEL):
+                        chat_kwargs["temperature"] = 0.2
+
+                    try:
+                        chat_res = client.chat.completions.create(**chat_kwargs)
+                    except Exception as api_err:
+                        if "temperature" in str(api_err).lower():
+                            chat_kwargs.pop("temperature", None)
+                            chat_res = client.chat.completions.create(**chat_kwargs)
+                        else:
+                            raise api_err
+
+                    raw_answer = chat_res.choices[0].message.content or ""
+                    prompt_tok = chat_res.usage.prompt_tokens if chat_res.usage else 0
+                    comp_tok = chat_res.usage.completion_tokens if chat_res.usage else 0
+                    
+                    p_rates = PRICING.get(OPENAI_MODEL, PRICING.get("gpt-4o-mini", {"input": 0.150 / 1_000_000, "output": 0.600 / 1_000_000}))
+                    cost_usd = (prompt_tok * p_rates["input"]) + (comp_tok * p_rates["output"]) + ret_cost
+
+                    # Normalize citation tags and re-index sequentially
+                    normalized_answer = normalize_citation_tags(raw_answer)
+                    old_to_new = {}
+                    used_citations = []
+                    for m in re.finditer(r"\[(\d+)\]", normalized_answer):
+                        old_n = int(m.group(1))
+                        if old_n not in old_to_new and 1 <= old_n <= len(raw_citations):
+                            new_n = len(old_to_new) + 1
+                            old_to_new[old_n] = new_n
+                            orig = raw_citations[old_n - 1].copy()
+                            orig["n"] = new_n
+                            used_citations.append(orig)
+
+                    if old_to_new:
+                        answer = re.sub(r"\[(\d+)\]", lambda m: f"[{old_to_new.get(int(m.group(1)), m.group(1))}]", normalized_answer)
+                        citations = used_citations
+                    else:
+                        answer = normalized_answer
+                        citations = raw_citations if re.search(r"\[\d+\]", answer) else []
+
+                except Exception as e:
+                    raise HTTPException(502, f"OpenAI generation failed: {e}")
+            else:
+                cost_usd = 0.0
+                prompt_tok = 0
+                comp_tok = 0
+                citations = raw_citations
+                answer = "### Matching Passages (Local Mode):\n\n" + "\n\n".join(
+                    f"**[{c['n']}] {c['source_name']}:**\n> {hits[i]['content']}" for i, c in enumerate(citations)
+                )
 
     latency_s = round(time.time() - t0, 2)
 
