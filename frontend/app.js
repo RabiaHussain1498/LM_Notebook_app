@@ -175,6 +175,11 @@ function renderSourcesList() {
     const isSelected = currentDocId === s.id ? "selected-reading" : "";
     const chunks = s.chunks_count !== undefined ? s.chunks_count : 0;
     const chunkLabel = `${chunks} chunk${chunks === 1 ? "" : "s"}`;
+    const cost = Number(s.embedding_cost || 0);
+    const isOpenAI = s.embedding_model && s.embedding_model.startsWith("text-embedding");
+    const costLabel = isOpenAI
+      ? `<span class="source-cost-badge" title="OpenAI ${esc(s.embedding_model)} · embedding cost">⚡ $${cost.toFixed(6)}</span>`
+      : `<span class="source-cost-badge source-cost-local" title="Indexed locally with TF-IDF — no API cost">local</span>`;
     return `
       <div class="source-item-row ${isSelected}" data-id="${s.id}">
         <span class="source-icon-badge">${icon}</span>
@@ -182,6 +187,7 @@ function renderSourcesList() {
           <span class="source-row-title" title="${esc(s.name)}">${esc(s.name)}</span>
           <div class="source-row-meta">
             <span class="source-chunk-badge" title="${chunkLabel} indexed in ChromaDB">🧩 ${chunkLabel}</span>
+            ${costLabel}
           </div>
         </div>
         <input type="checkbox" class="source-checkbox" data-id="${s.id}" ${s.enabled ? "checked" : ""} onclick="event.stopPropagation()">
@@ -199,7 +205,7 @@ function switchToSourcesListView() {
   renderSourcesList();
 }
 
-async function openDocPreviewInLeftBar(sourceId, highlightChunkIndex = null, highlightText = null) {
+async function openDocPreviewInLeftBar(sourceId, highlightText = null) {
   currentDocId = sourceId;
   const details = await api(`/sources/${sourceId}`);
 
@@ -211,66 +217,86 @@ async function openDocPreviewInLeftBar(sourceId, highlightChunkIndex = null, hig
   $("doc-emb-tag").textContent = `${details.embedding_model || "emb-3-small"} · ${chunksCount} chunk${chunksCount === 1 ? "" : "s"}`;
 
   const container = $("doc-content-body");
-  if (details.chunks && details.chunks.length) {
-    container.innerHTML = details.chunks.map(c => `
-      <div class="chunk-row" id="chunk-${details.id}-${c.chunk_index}">
-        <div class="chunk-text">${esc(c.content)}</div>
-      </div>
-    `).join("");
-  } else {
-    container.innerHTML = `<div class="chunk-row"><div class="chunk-text">${esc(details.text)}</div></div>`;
-  }
+  // Always show the original full document text, not the internal RAG chunks
+  const fullText = details.text || "";
+  container.innerHTML = `<div class="doc-full-text" id="doc-full-text-${details.id}"></div>`;
+  // Use textContent so no HTML injection; CSS pre-wrap preserves newlines
+  $(`doc-full-text-${details.id}`).textContent = fullText;
 
-  if (highlightChunkIndex !== null) {
-    jumpAndHighlightChunkInPreview(details.id, highlightChunkIndex, highlightText);
+  if (highlightText) {
+    // Small delay lets the DOM settle before we try to highlight
+    setTimeout(() => highlightInDocument(details.id, highlightText), 30);
   }
 }
 
 $("btn-back-to-sources").onclick = switchToSourcesListView;
 
-function jumpAndHighlightChunkInPreview(sourceId, chunkIndex, highlightText = null) {
-  const el = $(`chunk-${sourceId}-${chunkIndex}`);
-  if (!el) return;
+// Search the full original document text and highlight the matching passage
+function highlightInDocument(sourceId, highlightText) {
+  const container = $(`doc-full-text-${sourceId}`);
+  if (!container || !highlightText) return;
 
-  const contentEl = el.querySelector(".chunk-text");
-  if (contentEl && highlightText) {
-    const rawText = contentEl.textContent.replace(/\u00a0/g, " ");
-    const normalize = value => value.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
-    const normalizedText = normalize(rawText);
-    const normalizedHighlight = normalize(highlightText);
-    const matchIndex = normalizedText.indexOf(normalizedHighlight);
+  const rawText = container.textContent;
+  const collapseWS = s => s.replace(/[\u00a0\s]+/g, " ").trim();
+  const normalizedRaw = collapseWS(rawText);
 
-    if (matchIndex >= 0) {
-      let rawStart = 0;
-      let normalizedCount = 0;
-      while (rawStart < rawText.length && normalizedCount < matchIndex) {
-        const char = rawText[rawStart];
-        if (/\s/.test(char) && rawText.slice(rawStart).match(/^\s+/)?.[0]) {
-          const whitespace = rawText.slice(rawStart).match(/^\s+/)[0];
-          rawStart += whitespace.length;
-          normalizedCount += 1;
-        } else {
-          rawStart += char.length;
-          normalizedCount += 1;
-        }
-      }
+  // Strip any residual [Header] prefix old chunker stored at chunk start
+  const cleanHL = highlightText.replace(/^\[[\s\S]*?\]\s*/, '').trim();
 
-      const rawEnd = rawStart + normalizedHighlight.length;
-      const before = document.createTextNode(rawText.slice(0, rawStart));
-      const match = document.createElement("mark");
-      match.className = "citation-highlight";
-      match.textContent = rawText.slice(rawStart, rawEnd);
-      const after = document.createTextNode(rawText.slice(rawEnd));
+  // Multi-strategy search: most specific → least specific
+  const strategies = [
+    collapseWS(cleanHL),                                               // 1. full chunk
+    cleanHL.length > 100 ? collapseWS(cleanHL.slice(0, 300)) : null,  // 2. first 300 chars
+    cleanHL.length > 200                                               // 3. middle 200-char window
+      ? collapseWS(cleanHL.slice(Math.floor(cleanHL.length * 0.2), Math.floor(cleanHL.length * 0.2) + 200))
+      : null,
+    (cleanHL.match(/^.{20,}?[.!?]/s) || [cleanHL.slice(0, 100)])[0]   // 4. first sentence
+      ? collapseWS((cleanHL.match(/^.{20,}?[.!?]/s) || [cleanHL.slice(0, 100)])[0])
+      : null,
+  ].filter(Boolean);
 
-      contentEl.replaceChildren(before, match, after);
-      match.scrollIntoView({ behavior: "smooth", block: "center" });
-      return;
+  let normalizedHL = "";
+  let normIdx = -1;
+  for (const candidate of strategies) {
+    normIdx = normalizedRaw.indexOf(candidate);
+    if (normIdx >= 0) { normalizedHL = candidate; break; }
+  }
+
+  if (normIdx < 0) {
+    container.scrollIntoView({ behavior: "smooth", block: "start" });
+    container.classList.add("highlight-pulse");
+    setTimeout(() => container.classList.remove("highlight-pulse"), 3000);
+    return;
+  }
+
+  // Walk rawText char-by-char with parallel normalized cursor to map positions
+  let rawStart = -1, rawEnd = -1;
+  let ni = 0, ri = 0;
+  const normEnd = normIdx + normalizedHL.length;
+
+  while (ri < rawText.length) {
+    if (/[\u00a0\s]/.test(rawText[ri])) {
+      if (rawStart === -1 && ni === normIdx && normalizedRaw[ni] === " ") rawStart = ri;
+      while (ri < rawText.length && /[\u00a0\s]/.test(rawText[ri])) ri++;
+      if (ni === normEnd) { rawEnd = ri; break; }
+      if (rawStart === -1 && ni + 1 === normIdx) rawStart = ri;
+      ni++;
+    } else {
+      if (ni === normIdx && rawStart === -1) rawStart = ri;
+      ri++; ni++;
+      if (ni === normEnd) { rawEnd = ri; break; }
     }
   }
 
-  el.scrollIntoView({ behavior: "smooth", block: "center" });
-  el.classList.add("highlight-pulse");
-  setTimeout(() => el.classList.remove("highlight-pulse"), 3500);
+  if (rawStart >= 0 && rawEnd > rawStart) {
+    const before = document.createTextNode(rawText.slice(0, rawStart));
+    const mark = document.createElement("mark");
+    mark.className = "citation-highlight";
+    mark.textContent = rawText.slice(rawStart, rawEnd);
+    const after = document.createTextNode(rawText.slice(rawEnd));
+    container.replaceChildren(before, mark, after);
+    mark.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
 }
 
 // Left Source Click
@@ -322,14 +348,17 @@ $("btn-save-paste").onclick = safeAction(async () => {
 
 const handleUploadFiles = safeAction(async files => {
   addDlg.close();
+  let totalChunks = 0;
   for (const f of files) {
     showToast(`Uploading ${f.name}...`);
     const fd = new FormData();
     fd.append("file", f);
-    await api(`/notebooks/${currentNotebookId}/sources/upload`, { form: fd });
+    const res = await api(`/notebooks/${currentNotebookId}/sources/upload`, { form: fd });
+    totalChunks += res.chunks_count || 0;
   }
   await refreshSources();
-  showToast("Uploaded and indexed.");
+  await updateNotebookTotalCost();
+  showToast(`Uploaded & indexed — ${totalChunks} chunk${totalChunks === 1 ? "" : "s"}`);
 });
 
 $("file-input").onchange = e => handleUploadFiles(e.target.files);
@@ -495,20 +524,19 @@ function renderMessageBubble(role, content, citations = [], meta = {}) {
   return msgDiv;
 }
 
-// Click Citation in Chat -> Open Preview in Left Sidebar & Jump to Chunk
+// Click Citation in Chat -> Open Preview in Left Sidebar & Jump to passage
 $("chat-messages").onclick = safeAction(async e => {
   const citeBtn = e.target.closest(".cite-pill");
   if (!citeBtn) return;
 
   const sourceId = Number(citeBtn.dataset.sourceId);
-  const chunkIndex = Number(citeBtn.dataset.chunkIndex);
   const highlightText = citeBtn.dataset.citeContent || null;
 
-  if (!Number.isInteger(sourceId) || !Number.isInteger(chunkIndex)) {
+  if (!Number.isInteger(sourceId) || sourceId <= 0) {
     throw new Error("Citation metadata is unavailable.");
   }
 
-  await openDocPreviewInLeftBar(sourceId, chunkIndex, highlightText);
+  await openDocPreviewInLeftBar(sourceId, highlightText);
   showToast(`Jumped to citation [${citeBtn.dataset.citeNum}]`);
 });
 

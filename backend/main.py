@@ -1,5 +1,5 @@
 """
-NotebookLM AI Workspace: FastAPI + SQLite + Embeddings + Session Auth + Cost Tracking + In-Doc Citations & API Tools
+NotebookLM AI Workspace
 """
 import collections
 import io
@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS sources (
     text TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
     embedding_model TEXT DEFAULT 'tf-idf-local',
+    embedding_cost REAL DEFAULT 0.0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -165,6 +166,8 @@ def migrate_db(c):
     cols = [r[1] for r in cur.fetchall()]
     if "embedding_model" not in cols:
         cur.execute("ALTER TABLE sources ADD COLUMN embedding_model TEXT DEFAULT 'tf-idf-local'")
+    if "embedding_cost" not in cols:
+        cur.execute("ALTER TABLE sources ADD COLUMN embedding_cost REAL DEFAULT 0.0")
     if "created_at" not in cols:
         cur.execute("ALTER TABLE sources ADD COLUMN created_at TIMESTAMP")
 
@@ -249,18 +252,56 @@ app = FastAPI(title="NotebookLM AI App", lifespan=lifespan)
 def current_user() -> dict:
     return get_demo_user()
 
+def check_notebook_owner(notebook_id: int, user_id: int):
+    nb = db_query("SELECT id FROM notebooks WHERE id = ? AND user_id = ?", (notebook_id, user_id))
+    if not nb:
+        raise HTTPException(404, "Notebook not found or access denied.")
+
+def check_source_owner(source_id: int, user_id: int) -> dict:
+    src = db_query(
+        "SELECT s.* FROM sources s JOIN notebooks n ON s.notebook_id = n.id WHERE s.id = ? AND n.user_id = ?",
+        (source_id, user_id)
+    )
+    if not src:
+        raise HTTPException(404, "Source not found or access denied.")
+    return src[0]
+
 STOPWORDS = set("the a an is are was were of to in on and or for with what how why who when which do does did it this that be as at by from about me my you your tell can i we us they them he she had have has".split())
+
+def clean_pdf_text(text: str) -> str:
+    """
+    Fix common pypdf extraction artifacts:
+    - Dehyphenate broken words across lines (impres-\nsive -> impressive)
+    - Collapse multiple spaces to single space
+    - Remove isolated page numbers
+    - Normalize unicode dashes and quotes
+    """
+    # Merge hyphenated line-breaks: "impres-\nsive" -> "impressive"
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+    # Remove lines that are just page numbers (1-4 digits alone on a line)
+    text = re.sub(r"\n\s*\d{1,4}\s*\n", "\n", text)
+    # Collapse multiple spaces (but not newlines)
+    text = re.sub(r"[^\S\n]+", " ", text)
+    # Normalize dashes and quotes to ASCII
+    text = text.replace("\u2013", "-").replace("\u2014", "-")
+    text = text.replace("\u201c", '"').replace("\u201d", '"')
+    text = text.replace("\u2018", "'").replace("\u2019", "'")
+    # Strip trailing spaces on each line
+    text = "\n".join(line.rstrip() for line in text.split("\n"))
+    return text.strip()
 
 def tokenize(text: str) -> List[str]:
     return [w for w in re.findall(r"[a-z0-9']+", text.lower()) if w not in STOPWORDS and len(w) > 1]
 
-def chunk_markdown_or_text(text: str, target_size: int = 550, overlap: int = 70) -> List[str]:
+def chunk_markdown_or_text(text: str, target_size: int = 600, overlap: int = 0) -> List[str]:
     """
-    Hybrid Structural + Sentence Chunking for Prose, PDFs, Notes, Markdown & Web Pages:
-    1. Tracks section/header hierarchy (# H1, ## H2, ### H3, Section:).
-    2. Splits along natural paragraphs & bullet points.
-    3. Splits large paragraphs along sentence boundaries ([.!?]).
-    4. Applies contextual sliding overlap without cutting mid-sentence.
+    Clean Paragraph + Sentence Chunking for Prose, PDFs, Markdown:
+    - Splits on section boundaries (headers) and paragraph breaks.
+    - Splits large paragraphs on sentence boundaries.
+    - NO overlap injected into stored chunk content (overlap caused broken display
+      and prevented highlight search from matching chunks back to original text).
+    - NO [Header] prefix prepended (caused indexOf search failure in frontend).
+    - Chunks are clean, contiguous substrings of the original text.
     """
     normalized = re.sub(r"\r\n|\r", "\n", text).strip()
     if not normalized:
@@ -268,45 +309,41 @@ def chunk_markdown_or_text(text: str, target_size: int = 550, overlap: int = 70)
 
     lines = normalized.split("\n")
     sections = []
-    current_header = ""
-    current_block = []
+    current_block: List[str] = []
 
     for line in lines:
-        header_match = re.match(r"^(#{1,6}\s+.+|[A-Z0-9\s]{3,40}:)$", line.strip())
-        if header_match:
+        # Detect section headers: # Markdown headers or ALL-CAPS: labels
+        if re.match(r"^(#{1,6}\s+.+|[A-Z][A-Z0-9\s]{2,38}:)$", line.strip()):
             if current_block:
-                sections.append((current_header, "\n".join(current_block)))
+                sections.append("\n".join(current_block))
                 current_block = []
-            current_header = header_match.group(1).strip()
         current_block.append(line)
 
     if current_block:
-        sections.append((current_header, "\n".join(current_block)))
+        sections.append("\n".join(current_block))
 
-    chunks_out = []
+    chunks_out: List[str] = []
 
-    for header, content in sections:
-        header_prefix = f"[{header}]\n" if header and not content.startswith(header) else ""
+    for content in sections:
         paragraphs = [p.strip() for p in re.split(r"\n\s*\n", content) if p.strip()]
-        
+
         current_chunk = ""
         for para in paragraphs:
             if len(para) > target_size:
+                # Split large paragraph by sentences
                 sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", para) if s.strip()]
                 for sentence in sentences:
-                    if current_chunk and len(current_chunk) + len(sentence) > target_size:
+                    if current_chunk and len(current_chunk) + 1 + len(sentence) > target_size:
                         chunks_out.append(current_chunk.strip())
-                        overlap_text = current_chunk[-overlap:].strip()
-                        current_chunk = (header_prefix + overlap_text + " " if overlap_text else header_prefix) + sentence
+                        current_chunk = sentence          # clean start, no overlap
                     else:
-                        current_chunk += (" " if current_chunk else header_prefix) + sentence
+                        current_chunk += (" " if current_chunk else "") + sentence
             else:
-                if current_chunk and len(current_chunk) + len(para) > target_size:
+                if current_chunk and len(current_chunk) + 2 + len(para) > target_size:
                     chunks_out.append(current_chunk.strip())
-                    overlap_text = current_chunk[-overlap:].strip()
-                    current_chunk = (header_prefix + overlap_text + "\n\n" if overlap_text else header_prefix) + para
+                    current_chunk = para                  # clean start, no overlap
                 else:
-                    current_chunk += ("\n\n" if current_chunk else header_prefix) + para
+                    current_chunk += ("\n\n" if current_chunk else "") + para
 
         if current_chunk.strip():
             chunks_out.append(current_chunk.strip())
@@ -523,28 +560,6 @@ def retrieve_top_chunks(
     scored.sort(key=lambda x: -x[0])
     return [doc for _, doc in scored[:k]], strategy_used, retrieval_cost
 
-def execute_attached_api(api_id: int, user_params: Dict[str, Any] = {}) -> Dict[str, Any]:
-    apis = db_query("SELECT id, name, url, method, headers, description FROM attached_apis WHERE id = ? AND enabled = 1", (api_id,))
-    if not apis:
-        raise HTTPException(404, "Attached API not found or disabled.")
-    api_info = apis[0]
-    headers = json.loads(api_info["headers"] or "{}")
-    url = api_info["url"]
-    method = api_info["method"].upper()
-    
-    try:
-        if method == "GET":
-            resp = requests.get(url, params=user_params, headers=headers, timeout=10)
-        else:
-            resp = requests.post(url, json=user_params, headers=headers, timeout=10)
-        return {
-            "api_name": api_info["name"],
-            "status": resp.status_code,
-            "data": resp.json() if "application/json" in resp.headers.get("Content-Type", "") else resp.text[:2000]
-        }
-    except Exception as e:
-        return {"api_name": api_info["name"], "error": str(e)}
-
 # Pydantic models
 class NotebookIn(BaseModel):
     title: str = "Untitled notebook"
@@ -562,17 +577,25 @@ class ChatIn(BaseModel):
     target_source_id: Optional[int] = None
     highlighted_context: Optional[str] = None
 
-class AttachedApiIn(BaseModel):
-    name: str
-    url: str
-    method: str = "GET"
-    headers: str = "{}"
-    description: str = ""
-
 # API Endpoints
 @app.get("/api/health")
 def health():
-    return {"ai": bool(OPENAI_KEY), "model": OPENAI_MODEL}
+    chroma_status = "ok"
+    chroma_count = 0
+    try:
+        chroma_count = rag_collection.count()
+    except Exception as e:
+        chroma_status = f"error: {e}"
+        
+    return {
+        "status": "ok",
+        "ai": bool(OPENAI_KEY),
+        "model": OPENAI_MODEL,
+        "chroma": {
+            "status": chroma_status,
+            "total_vectors": chroma_count
+        }
+    }
 
 @app.get("/api/notebooks")
 def list_notebooks(user: dict = Depends(current_user)):
@@ -589,6 +612,7 @@ def create_notebook(body: NotebookIn, user: dict = Depends(current_user)):
 
 @app.get("/api/notebooks/{nid}/cost")
 def get_notebook_cost(nid: int, user: dict = Depends(current_user)):
+    check_notebook_owner(nid, user["id"])
     costs = db_query(
         "SELECT SUM(cost_usd) as total_cost, SUM(prompt_tokens) as prompt_tokens, SUM(completion_tokens) as completion_tokens, COUNT(id) as total_queries FROM messages WHERE notebook_id = ? AND role = 'assistant'",
         (nid,)
@@ -611,11 +635,13 @@ def get_notebook_cost(nid: int, user: dict = Depends(current_user)):
 
 @app.patch("/api/notebooks/{nid}")
 def rename_notebook(nid: int, body: NotebookIn, user: dict = Depends(current_user)):
+    check_notebook_owner(nid, user["id"])
     db_execute("UPDATE notebooks SET title = ? WHERE id = ? AND user_id = ?", (body.title.strip()[:120] or "Untitled notebook", nid, user["id"]))
     return {"ok": True}
 
 @app.delete("/api/notebooks/{nid}")
 def delete_notebook(nid: int, user: dict = Depends(current_user)):
+    check_notebook_owner(nid, user["id"])
     try:
         rag_collection.delete(where={"notebook_id": {"$eq": int(nid)}})
     except Exception as e:
@@ -626,7 +652,7 @@ def delete_notebook(nid: int, user: dict = Depends(current_user)):
 def store_source_and_index(notebook_id: int, user_id: int, name: str, kind: str, text: str) -> Dict[str, Any]:
     emb_model = select_embedding_model(kind, text)
     sid = db_execute(
-        "INSERT INTO sources(notebook_id, name, kind, text, enabled, embedding_model) VALUES (?, ?, ?, ?, 1, ?)",
+        "INSERT INTO sources(notebook_id, name, kind, text, enabled, embedding_model, embedding_cost) VALUES (?, ?, ?, ?, 1, ?, 0.0)",
         (notebook_id, name[:140], kind, text, emb_model)
     )
     raw_chunks = chunk_text(text, kind=kind)
@@ -642,6 +668,7 @@ def store_source_and_index(notebook_id: int, user_id: int, name: str, kind: str,
                     (user_id, notebook_id, emb_model, tokens, emb_cost)
                 )
                 db_execute("UPDATE users SET total_cost = total_cost + ? WHERE id = ?", (emb_cost, user_id))
+                db_execute("UPDATE sources SET embedding_cost = ? WHERE id = ?", (emb_cost, sid))
         except Exception as e:
             print(f"Embedding error: {e}")
             embeddings = []
@@ -696,8 +723,11 @@ def store_source_and_index(notebook_id: int, user_id: int, name: str, kind: str,
 
 @app.get("/api/notebooks/{nid}/sources")
 def list_sources(nid: int, user: dict = Depends(current_user)):
+    check_notebook_owner(nid, user["id"])
     return db_query(
-        """SELECT s.id, s.name, s.kind, s.enabled, s.embedding_model, length(s.text) AS chars, s.created_at,
+        """SELECT s.id, s.name, s.kind, s.enabled, s.embedding_model,
+                  length(s.text) AS chars, s.created_at,
+                  COALESCE(s.embedding_cost, 0.0) AS embedding_cost,
                   COUNT(c.id) AS chunks_count
            FROM sources s
            LEFT JOIN chunks c ON s.id = c.source_id
@@ -709,27 +739,27 @@ def list_sources(nid: int, user: dict = Depends(current_user)):
 
 @app.get("/api/sources/{sid}")
 def get_source_details(sid: int, user: dict = Depends(current_user)):
-    src = db_query("SELECT id, notebook_id, name, kind, text, enabled, embedding_model, created_at FROM sources WHERE id = ?", (sid,))
-    if not src:
-        raise HTTPException(404, "Source not found")
+    src = check_source_owner(sid, user["id"])
     chunks = db_query("SELECT id AS chunk_id, chunk_index, content FROM chunks WHERE source_id = ? ORDER BY chunk_index ASC", (sid,))
-    res = dict(src[0])
+    res = dict(src)
     res["chunks"] = chunks
     res["chunks_count"] = len(chunks)
     return res
 
 @app.post("/api/notebooks/{nid}/sources", status_code=201)
 def paste_source(nid: int, body: TextSourceIn, user: dict = Depends(current_user)):
+    check_notebook_owner(nid, user["id"])
     if not body.text.strip():
         raise HTTPException(400, "Paste some text first.")
     return store_source_and_index(nid, user["id"], body.name or "Pasted note", body.kind or "text", body.text.strip())
 
 @app.post("/api/notebooks/{nid}/sources/upload", status_code=201)
 def upload_source(nid: int, file: UploadFile = File(...), user: dict = Depends(current_user)):
+    check_notebook_owner(nid, user["id"])
     filename = file.filename or "uploaded_file"
     data = file.file.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, "File exceeds maximum size of 16 MB.")
+        raise HTTPException(413, "File exceeds maximum size of 200 MB.")
 
     kind = "file"
     text = ""
@@ -738,7 +768,8 @@ def upload_source(nid: int, file: UploadFile = File(...), user: dict = Depends(c
         kind = "pdf"
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(data))
-        text = "\n\n".join(p.extract_text() or "" for p in reader.pages)
+        raw = "\n\n".join(p.extract_text() or "" for p in reader.pages)
+        text = clean_pdf_text(raw)
     elif lower.endswith((".py", ".js", ".ts", ".html", ".css", ".json", ".sql", ".rs", ".go", ".cpp", ".java")):
         kind = "code"
         text = data.decode("utf-8", errors="replace")
@@ -759,11 +790,13 @@ def upload_source(nid: int, file: UploadFile = File(...), user: dict = Depends(c
 
 @app.patch("/api/sources/{sid}")
 def toggle_source(sid: int, body: EnabledIn, user: dict = Depends(current_user)):
+    check_source_owner(sid, user["id"])
     db_execute("UPDATE sources SET enabled = ? WHERE id = ?", (1 if body.enabled else 0, sid))
     return {"ok": True}
 
 @app.delete("/api/sources/{sid}")
 def delete_source(sid: int, user: dict = Depends(current_user)):
+    check_source_owner(sid, user["id"])
     try:
         rag_collection.delete(where={"source_id": {"$eq": int(sid)}})
     except Exception as e:
@@ -771,29 +804,9 @@ def delete_source(sid: int, user: dict = Depends(current_user)):
     db_execute("DELETE FROM sources WHERE id = ?", (sid,))
     return {"ok": True}
 
-@app.get("/api/notebooks/{nid}/apis")
-def list_attached_apis(nid: int, user: dict = Depends(current_user)):
-    return db_query("SELECT id, notebook_id, name, url, method, headers, description, enabled, created_at FROM attached_apis WHERE notebook_id = ?", (nid,))
-
-@app.post("/api/notebooks/{nid}/apis", status_code=201)
-def add_attached_api(nid: int, body: AttachedApiIn, user: dict = Depends(current_user)):
-    aid = db_execute(
-        "INSERT INTO attached_apis(notebook_id, name, url, method, headers, description, enabled) VALUES (?, ?, ?, ?, ?, ?, 1)",
-        (nid, body.name.strip(), body.url.strip(), body.method.upper(), body.headers, body.description)
-    )
-    return {"id": aid, "name": body.name, "url": body.url}
-
-@app.delete("/api/apis/{aid}")
-def delete_attached_api(aid: int, user: dict = Depends(current_user)):
-    db_execute("DELETE FROM attached_apis WHERE id = ?", (aid,))
-    return {"ok": True}
-
-@app.post("/api/apis/{aid}/test")
-def test_attached_api(aid: int, params: Dict[str, Any] = {}, user: dict = Depends(current_user)):
-    return execute_attached_api(aid, params)
-
 @app.get("/api/notebooks/{nid}/messages")
 def get_messages(nid: int, user: dict = Depends(current_user)):
+    check_notebook_owner(nid, user["id"])
     rows = db_query(
         "SELECT id, role, content, citations, target_source_id, cost_usd, prompt_tokens, completion_tokens, created_at FROM messages WHERE notebook_id = ? ORDER BY id ASC",
         (nid,)
@@ -807,6 +820,7 @@ def get_messages(nid: int, user: dict = Depends(current_user)):
 
 @app.post("/api/notebooks/{nid}/chat")
 def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(current_user)):
+    check_notebook_owner(nid, user["id"])
     t0 = time.time()
     question = body.question.strip()
     if not question:
@@ -846,11 +860,6 @@ def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(current_user)
 
         context_str = "\n\n".join(context_parts)
 
-        apis = db_query("SELECT id, name, description FROM attached_apis WHERE notebook_id = ? AND enabled = 1", (nid,))
-        api_notice = ""
-        if apis:
-            api_notice = f"\nAvailable APIs connected to this notebook: {', '.join(a['name'] + ' (' + a['description'] + ')' for a in apis)}"
-
         if OPENAI_KEY:
             from openai import OpenAI
             client = OpenAI(api_key=OPENAI_KEY)
@@ -864,7 +873,6 @@ def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(current_user)
                 "You are an AI research assistant. Your task is to answer questions strictly and accurately using the provided numbered sources.\n"
                 "Format citations inline using square brackets like [1], [2] next to every claim or quote.\n"
                 "If the sources do not contain the answer, explicitly state that the documents don't provide sufficient information.\n"
-                f"{api_notice}"
             )
 
             messages_payload = [
