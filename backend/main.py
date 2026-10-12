@@ -130,13 +130,20 @@ def get_db():
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
+def _sanitize_db_arg(val: Any) -> Any:
+    if isinstance(val, str):
+        return val.replace("\x00", "").encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+    return val
+
 def db_query(sql: str, args: tuple = ()):
     with closing(get_db()) as c:
-        return [dict(r) for r in c.execute(sql, args).fetchall()]
+        sanitized_args = tuple(_sanitize_db_arg(a) for a in args) if args else ()
+        return [dict(r) for r in c.execute(sql, sanitized_args).fetchall()]
 
 def db_execute(sql: str, args: tuple = ()):
     with closing(get_db()) as c:
-        cur = c.execute(sql, args)
+        sanitized_args = tuple(_sanitize_db_arg(a) for a in args) if args else ()
+        cur = c.execute(sql, sanitized_args)
         c.commit()
         return cur.lastrowid
 
@@ -282,6 +289,13 @@ def check_source_owner(source_id: int, user_id: int) -> dict:
 
 STOPWORDS = set("the a an is are was were of to in on and or for with what how why who when which do does did it this that be as at by from about me my you your tell can i we us they them he she had have has".split())
 
+def sanitize_text(text: str) -> str:
+    """Sanitize string by stripping null bytes and replacing lone unicode surrogate code points."""
+    if not isinstance(text, str):
+        return ""
+    text = text.replace("\x00", "")
+    return text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+
 def clean_pdf_text(text: str) -> str:
     """
     Fix common pypdf extraction artifacts:
@@ -291,6 +305,7 @@ def clean_pdf_text(text: str) -> str:
     - Remove isolated page numbers
     - Normalize unicode dashes and quotes
     """
+    text = sanitize_text(text)
     text = text.replace("\xa0", " ").replace("\u200b", "")
     # Merge hyphenated line-breaks: "impres-\nsive" -> "impressive"
     text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
@@ -675,12 +690,15 @@ def store_source_and_index(
     text: str,
     folder_path: str = "",
 ) -> Dict[str, Any]:
+    name = sanitize_text(name)
+    text = sanitize_text(text)
+    folder_path = sanitize_text(folder_path)
     emb_model = select_embedding_model(kind, text)
     sid = db_execute(
         "INSERT INTO sources(notebook_id, name, kind, text, enabled, embedding_model, embedding_cost, folder_path) VALUES (?, ?, ?, ?, 1, ?, 0.0, ?)",
         (notebook_id, name[:140], kind, text, emb_model, folder_path)
     )
-    raw_chunks = chunk_text(text, kind=kind)
+    raw_chunks = [sanitize_text(c) for c in chunk_text(text, kind=kind)]
     embeddings = []
     emb_cost = 0.0
 
@@ -775,9 +793,10 @@ def get_source_details(sid: int, user: dict = Depends(current_user)):
 @app.post("/api/notebooks/{nid}/sources", status_code=201)
 def paste_source(nid: int, body: TextSourceIn, user: dict = Depends(current_user)):
     check_notebook_owner(nid, user["id"])
-    if not body.text.strip():
+    clean_text = sanitize_text(body.text)
+    if not clean_text.strip():
         raise HTTPException(400, "Paste some text first.")
-    return store_source_and_index(nid, user["id"], body.name or "Pasted note", body.kind or "text", body.text.strip())
+    return store_source_and_index(nid, user["id"], sanitize_text(body.name or "Pasted note"), body.kind or "text", clean_text.strip())
 
 @app.post("/api/notebooks/{nid}/sources/upload", status_code=201)
 def upload_source(
@@ -804,9 +823,12 @@ def upload_source(
     lower = filename.lower()
     if lower.endswith(".pdf"):
         kind = "pdf"
-        from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(data))
-        raw = "\n\n".join(p.extract_text() or "" for p in reader.pages)
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            raw = "\n\n".join(p.extract_text() or "" for p in reader.pages)
+        except Exception as e:
+            raise HTTPException(400, f"Could not read PDF: {str(e)}")
         text = clean_pdf_text(raw)
     elif lower.endswith((".py", ".js", ".ts", ".html", ".css", ".json", ".sql", ".rs", ".go", ".cpp", ".java")):
         kind = "code"
@@ -821,11 +843,12 @@ def upload_source(
         kind = "file"
         text = data.decode("utf-8", errors="replace")
 
+    text = sanitize_text(text)
     if not text.strip():
         raise HTTPException(400, "Could not extract readable text from that file.")
 
     return store_source_and_index(
-        nid, user["id"], filename, kind, text.strip(), normalized_folder_path
+        nid, user["id"], sanitize_text(filename), kind, text.strip(), normalized_folder_path
     )
 
 @app.patch("/api/sources/{sid}")
