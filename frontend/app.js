@@ -513,6 +513,48 @@ async function loadMessages() {
   scrollToBottom(false);
 }
 
+function extractGroundedPassage(claimText, chunkText) {
+  if (!chunkText) return "";
+  if (!claimText) return chunkText;
+
+  // Split into sentences, citations, or distinct paragraphs
+  const sentences = chunkText
+    .split(/(?<=[.!?])\s+|\n(?=\[\d+\])|\n(?=[A-Z\s]{4,30}\n)|\n\s*\n/)
+    .map(s => s.trim())
+    .filter(s => s.length > 10);
+
+  if (sentences.length <= 1) return chunkText;
+
+  const stopWords = new Set(["the", "a", "an", "is", "are", "was", "were", "of", "to", "in", "on", "and", "or", "for", "with", "what", "how", "why", "who", "it", "this", "that", "be", "as", "at", "by", "from", "about", "we", "i", "they", "them", "these", "those"]);
+  const getTokens = str => (str.toLowerCase().match(/[a-z0-9']+/g) || []).filter(w => !stopWords.has(w) && w.length > 1);
+  const claimTokens = new Set(getTokens(claimText));
+
+  if (claimTokens.size === 0) return chunkText;
+
+  let bestSent = chunkText;
+  let bestScore = -1;
+  let bestOverlap = 0;
+
+  for (const sent of sentences) {
+    const sTokens = getTokens(sent);
+    let overlap = 0;
+    for (const t of sTokens) {
+      if (claimTokens.has(t)) overlap++;
+    }
+    const score = overlap / (Math.sqrt(claimTokens.size * (sTokens.length || 1)) + 1e-5);
+    if (score > bestScore || (score === bestScore && overlap > bestOverlap)) {
+      bestScore = score;
+      bestOverlap = overlap;
+      bestSent = sent;
+    }
+  }
+
+  if (bestOverlap >= 2 || (claimTokens.size <= 3 && bestOverlap >= 1)) {
+    return bestSent;
+  }
+  return chunkText;
+}
+
 function renderMessageBubble(role, content, citations = [], meta = {}) {
   const chatEl = $("chat-messages");
   const msgDiv = document.createElement("div");
@@ -545,13 +587,22 @@ function renderMessageBubble(role, content, citations = [], meta = {}) {
       offset = match.index + match[0].length;
 
       const citation = citationMap.get(num);
+      let groundedText = "";
+      if (citation) {
+        if (citation.highlight_text && citation.highlight_text.length < (citation.content || "").length) {
+          groundedText = citation.highlight_text;
+        } else {
+          groundedText = extractGroundedPassage(textBefore || line, citation.content || citation.snippet || "");
+        }
+      }
+
       const button = document.createElement("button");
       button.type = "button";
       button.className = "cite-pill";
       button.dataset.citeNum = String(num);
       button.dataset.sourceId = citation ? String(citation.source_id) : "";
       button.dataset.chunkIndex = citation ? String(citation.chunk_index) : "";
-      button.dataset.citeContent = citation ? citation.content ?? citation.snippet : "";
+      button.dataset.citeContent = groundedText || (citation ? citation.content ?? citation.snippet : "");
       button.title = "";  // clear native title; we use custom tooltip
       button.textContent = `[${num}]`;
       button.disabled = !citation;
@@ -561,7 +612,7 @@ function renderMessageBubble(role, content, citations = [], meta = {}) {
         const tooltip = document.createElement("span");
         tooltip.className = "cite-tooltip";
 
-        const citeContent = (citation.content ?? citation.snippet ?? "").trim();
+        const citeContent = (groundedText || citation.content || citation.snippet || "").trim();
         const sourceName = citation.source_name || "";
 
         if (sourceName) {

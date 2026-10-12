@@ -253,6 +253,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="NotebookLM AI App", lifespan=lifespan)
 
+@app.middleware("http")
+async def add_no_cache_header(request, call_next):
+    response = await call_next(request)
+    path = request.url.path.lower()
+    if path.endswith((".js", ".css", ".html")) or path == "/":
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 def current_user() -> dict:
     return get_demo_user()
 
@@ -299,7 +309,9 @@ def clean_pdf_text(text: str) -> str:
 
 def is_heading_or_section_start(text: str) -> bool:
     first_line = text.split("\n")[0].strip()
-    if re.match(r"^(#{1,6}\s+|[A-Z][A-Za-z0-9\s]{1,40}:|\d+[\.\)]\s+|(?:Q|Question|Checkpoint|Exercise|Problem|Task|Day|Part|Section|Chapter|About|To\s+my|Author|Copyright|Dedication|Introduction|Conclusion|References)\b)", first_line, re.I):
+    if re.match(r"^(#{1,6}\s+|[A-Z][A-Za-z0-9\s]{1,40}:|\d+[\.\)]\s+|\[\d+\]\s+|(?:Q|Question|Checkpoint|Exercise|Problem|Task|Day|Part|Section|Chapter|About|To\s+my|Author|Copyright|Dedication|Introduction|Conclusion|References|Bibliography|Abstract|Methods|Discussion)\b)", first_line, re.I):
+        return True
+    if len(first_line) < 45 and re.match(r"^[A-Z\s]{3,30}$", first_line):
         return True
     if len(first_line) < 45 and re.match(r"^[A-Z][a-z]+(?:\s+[A-Za-z0-9\(\)]+){0,5}$", first_line):
         return True
@@ -320,7 +332,7 @@ def chunk_markdown_or_text(text: str, target_size: int = 600, overlap: int = 0) 
     if not normalized:
         return []
 
-    pattern = r"\n\s*\n|\n(?=(?:(?:\d+|[a-zA-Z])[\.\)]\s+|(?:Q|Question|Checkpoint|Exercise|Problem|Task|Day|Part|Section|Chapter|About|To\s+my|Author|Dedication|Introduction|Conclusion)\b|#{1,6}\s+|[-*•]\s+|[A-Z][A-Za-z0-9\s]{1,35}:|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,4}\s*\n))"
+    pattern = r"\n\s*\n|\n(?=(?:(?:\d+|[a-zA-Z])[\.\)]\s+|\[\d+\]\s+|(?:Q|Question|Checkpoint|Exercise|Problem|Task|Day|Part|Section|Chapter|About|To\s+my|Author|Dedication|Introduction|Conclusion|References|Bibliography|Abstract|Methods|Discussion)\b|#{1,6}\s+|[-*•]\s+|[A-Z][A-Za-z0-9\s]{1,35}:|[A-Z\s]{4,30}\n|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,4}\s*\n))"
     units = [u.strip() for u in re.split(pattern, normalized) if u.strip()]
 
     chunks_out: List[str] = []
@@ -846,28 +858,6 @@ def get_messages(nid: int, user: dict = Depends(current_user)):
             r["citations"] = []
     return rows
 
-# Safety Guardrails
-SELF_HARM_REGEX = re.compile(
-    r"\b(suicide|suicidal|kill\s+(?:my\s*self|me)|end\s+my\s+life|self\s*harm|cutting\s+(?:my\s*self|me)|hang\s+(?:my\s*self|me)|want\s+to\s+die|how\s+to\s+die|commit\s+suicide|take\s+my\s+own\s+life)\b",
-    re.IGNORECASE
-)
-
-VIOLENCE_HARM_REGEX = re.compile(
-    r"\b(murder|assassinate|assassination|massacre|terrorist|terrorism|how\s+to\s+kill|ways\s+to\s+kill|instructions?\s+to\s+kill|kill\s+(?:someone|somebody|a\s+person|people|others|anyone)|hire\s+a\s+hitman|how\s+to\s+make\s+a\s+bomb|manufacture\s+explosives|school\s+shooting|build\s+a\s+weapon|poison\s+(?:someone|somebody|a\s+person|people))\b",
-    re.IGNORECASE
-)
-
-# Conversational Queries (Greetings / Identity)
-GREETING_REGEX = re.compile(
-    r"^\s*(hi|hy|hello|hey|heyy|greetings|good\s+morning|good\s+afternoon|good\s+evening|howdy|sup|yo|hola)\b[!\?.,\s]*$",
-    re.IGNORECASE
-)
-
-CAPABILITY_REGEX = re.compile(
-    r"^\s*(who\s+are\s+you|what\s+are\s+you|what\s+can\s+you\s+do|how\s+can\s+you\s+help|what\s+is\s+this\s+app|help\s*me|how\s+does\s+this\s+work|what\s+is\s+notebooklm)\b[!\?.,\s]*$",
-    re.IGNORECASE
-)
-
 def normalize_citation_tags(text: str) -> str:
     """Expand citation ranges and lists like [1]–[2] or [1, 2] to standard [1] [2]"""
     def expand_range(match):
@@ -882,6 +872,94 @@ def normalize_citation_tags(text: str) -> str:
     text = re.sub(r"\[(\d+(?:\s*,\s*\d+)+)\]", lambda m: " ".join(f"[{x.strip()}]" for x in m.group(1).split(",")), text)
     return text
 
+
+def deduplicate_citations(text: str) -> str:
+    """Deduplicate identical citations in immediate proximity or consecutive sentences."""
+    # 1. Collapse immediate duplicates like [3] [3] or [3], [3]
+    text = re.sub(r"(\[\d+\])(?:\s*,\s*|\s+)\1\b", r"\1", text)
+
+    # 2. Consecutive sentences/clauses ending in the exact same citation [N]
+    pattern = re.compile(r"\s*(\[\d+\])(\s*[\.\,\;\:]?\s+[^\[\]\n\r]+?)(\s*\[\d+\])")
+
+    def replacer(match):
+        tag1 = match.group(1).strip()
+        between = match.group(2)
+        tag2 = match.group(3).strip()
+        if tag1 == tag2:
+            return between + " " + tag2
+        return match.group(0)
+
+    for _ in range(5):
+        new_text = pattern.sub(replacer, text)
+        if new_text == text:
+            break
+        text = new_text
+
+    text = re.sub(r"  +", " ", text)
+    return text.strip()
+
+
+def extract_grounded_passage(claim_sentence: str, chunk_text: str) -> str:
+    """Find the exact sentence/passage in chunk_text that directly supports the claim_sentence."""
+    if not claim_sentence or not chunk_text:
+        return chunk_text
+
+    # Split into candidate sentences, citations, or list items
+    raw_parts = re.split(r"(?<=[.!?])\s+|\n(?=\[\d+\])|\n(?=[A-Z\s]{4,30}\n)|\n\s*\n", chunk_text)
+    sentences = [p.strip() for p in raw_parts if len(p.strip()) > 10]
+    if len(sentences) <= 1:
+        return chunk_text
+
+    claim_tokens = set(re.findall(r"[a-z0-9']+", claim_sentence.lower())) - STOPWORDS
+    if not claim_tokens:
+        return chunk_text
+
+    scored = []
+    for s in sentences:
+        s_tokens = set(re.findall(r"[a-z0-9']+", s.lower())) - STOPWORDS
+        if not s_tokens:
+            continue
+        common = claim_tokens & s_tokens
+        overlap = len(common)
+        score = overlap / ((len(claim_tokens) ** 0.5) * (len(s_tokens) ** 0.5) + 1e-5)
+        scored.append((score, overlap, s))
+
+    if not scored:
+        return chunk_text
+
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    best_score, best_overlap, best_sent = scored[0]
+    if best_overlap >= 2 or (len(claim_tokens) <= 3 and best_overlap >= 1):
+        return best_sent
+
+    return chunk_text
+
+
+GREETING_PATTERN = re.compile(
+    r"^\s*(hi+|hy+|hey+|hello+|hola|heya|howdy|sup|yo|greetings|good\s+(morning|afternoon|evening|day))\b[\s!?,.]*$",
+    re.IGNORECASE
+)
+
+OFFENSIVE_REGEX = re.compile(
+    r"\b(nigg[ae]r?|fagg?ot|kike|chink|cunt|bastard|asshole|motherfucker)\b|"
+    r"\b(fuck\s+(you|u|off)|kill\s+yourself|go\s+die)\b|"
+    r"\b(how\s+to\s+(make|build)\s+(a\s+)?(bomb|explosive|weapon))\b",
+    re.IGNORECASE
+)
+
+def check_offensive_content(text: str, client=None) -> bool:
+    if OFFENSIVE_REGEX.search(text):
+        return True
+    if client:
+        try:
+            mod_res = client.moderations.create(input=text)
+            if mod_res and mod_res.results and mod_res.results[0].flagged:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 @app.post("/api/notebooks/{nid}/chat")
 def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(current_user)):
     check_notebook_owner(nid, user["id"])
@@ -890,172 +968,189 @@ def chat_with_sources(nid: int, body: ChatIn, user: dict = Depends(current_user)
     if not question:
         raise HTTPException(400, "Please enter a question.")
 
-    # 1. Safety Guardrail: Self-harm / Suicide
-    if SELF_HARM_REGEX.search(question):
-        answer = (
-            "If you or someone you know is going through a difficult time or having thoughts of self-harm or suicide, "
-            "please know that you are not alone and support is available:\n\n"
-            "• **In the US & Canada:** Call or text **988** (Suicide & Crisis Lifeline)\n"
-            "• **In the UK:** Call **111** or text **SHOUT** to **85258**\n"
-            "• **International Resources:** Visit [befrienders.org](https://www.befrienders.org) or [iasp.info/resources/Crisis_Centres](https://www.iasp.info/resources/Crisis_Centres/)\n\n"
-            "Please reach out to a trusted person, counselor, or emergency services."
+    # 1. Handle common greetings cleanly without RAG lookups or crisis responses
+    if GREETING_PATTERN.match(question):
+        latency_s = round(time.time() - t0, 2)
+        answer = "Hello! How can I help you with your notes and research today?"
+        db_execute(
+            "INSERT INTO messages(notebook_id, user_id, role, content, target_source_id) VALUES (?, ?, 'user', ?, ?)",
+            (nid, user["id"], question, body.target_source_id)
         )
-        citations = []
-        cost_usd = 0.0
-        prompt_tok = 0
-        comp_tok = 0
-        strategy = "safety-guardrail"
-
-    # 2. Safety Guardrail: Violence / Harm / Illegal Acts
-    elif VIOLENCE_HARM_REGEX.search(question):
-        answer = (
-            "I cannot fulfill this request. I am designed to assist with research and note analysis, "
-            "and I cannot generate content or provide guidance related to violence, murder, self-harm, or illegal acts."
+        mid = db_execute(
+            "INSERT INTO messages(notebook_id, user_id, role, content, citations, target_source_id, cost_usd, prompt_tokens, completion_tokens) VALUES (?, ?, 'assistant', ?, ?, ?, 0.0, 0, 0)",
+            (nid, user["id"], answer, "[]", body.target_source_id)
         )
-        citations = []
-        cost_usd = 0.0
-        prompt_tok = 0
-        comp_tok = 0
-        strategy = "safety-guardrail"
+        return {
+            "id": mid,
+            "answer": answer,
+            "citations": [],
+            "cost_usd": 0.0,
+            "latency_s": latency_s,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "strategy": "greeting",
+            "model": OPENAI_MODEL if OPENAI_KEY else "Local Mode"
+        }
 
-    # 3. Conversational Queries: Greetings
-    elif GREETING_REGEX.match(question):
-        answer = "Hello! How can I help you with your notes and research today? You can select documents on the left and ask questions, generate summaries, or explore specific topics."
-        citations = []
-        cost_usd = 0.0
-        prompt_tok = 0
-        comp_tok = 0
-        strategy = "conversational-greeting"
+    openai_client = None
+    if OPENAI_KEY:
+        from openai import OpenAI
+        openai_client = OpenAI(api_key=OPENAI_KEY)
 
-    # 4. Conversational Queries: Identity & Capabilities
-    elif CAPABILITY_REGEX.match(question):
-        answer = (
-            "I am your NotebookLM AI assistant! I help you analyze, search, and synthesize information from your uploaded sources and notes.\n\n"
-            "Here is what you can do:\n"
-            "• **Upload Documents**: Add PDFs, Markdown, Word, PowerPoint, Code, or Text files in the left sidebar.\n"
-            "• **Ask Questions**: Ask anything grounded in your documents with precise source citations.\n"
-            "• **Highlight & Jump**: Click on any citation to open and highlight the exact passage in your document."
+    # 2. Guardrail check strictly for offensive/harmful material
+    if check_offensive_content(question, client=openai_client):
+        guardrail_msg = "I cannot process this request because it contains offensive or inappropriate content. Please keep questions focused on your research and notes."
+        latency_s = round(time.time() - t0, 2)
+        db_execute(
+            "INSERT INTO messages(notebook_id, user_id, role, content, target_source_id) VALUES (?, ?, 'user', ?, ?)",
+            (nid, user["id"], question, body.target_source_id)
         )
-        citations = []
-        cost_usd = 0.0
-        prompt_tok = 0
-        comp_tok = 0
-        strategy = "conversational-capability"
+        mid = db_execute(
+            "INSERT INTO messages(notebook_id, user_id, role, content, citations, target_source_id, cost_usd, prompt_tokens, completion_tokens) VALUES (?, ?, 'assistant', ?, ?, ?, 0.0, 0, 0)",
+            (nid, user["id"], guardrail_msg, "[]", body.target_source_id)
+        )
+        return {
+            "id": mid,
+            "answer": guardrail_msg,
+            "citations": [],
+            "cost_usd": 0.0,
+            "latency_s": latency_s,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "strategy": "guardrail",
+            "model": OPENAI_MODEL if OPENAI_KEY else "Local Mode"
+        }
 
-    # 5. Standard RAG Research Query
-    else:
-        hits, strategy, ret_cost = retrieve_top_chunks(
-            notebook_id=nid,
-            query=question,
-            target_source_id=body.target_source_id,
-            k=5
+    hits, strategy, ret_cost = retrieve_top_chunks(
+        notebook_id=nid,
+        query=question,
+        target_source_id=body.target_source_id,
+        k=5
+    )
+
+    raw_citations = []
+    context_parts = []
+
+    if body.highlighted_context:
+        context_parts.append(f"[Selection] Highlighted passage from document:\n{body.highlighted_context}")
+
+    for idx, hit in enumerate(hits, 1):
+        raw_citations.append({
+            "n": idx,
+            "source_id": hit["source_id"],
+            "source_name": hit["source_name"],
+            "chunk_id": hit["chunk_id"],
+            "chunk_index": hit["chunk_index"],
+            "content": hit["content"],
+            "snippet": hit["content"][:160] + "..." if len(hit["content"]) > 160 else hit["content"]
+        })
+        context_parts.append(f"[{idx}] (Source: {hit['source_name']})\n{hit['content']}")
+
+    context_str = "\n\n".join(context_parts)
+
+    if OPENAI_KEY:
+        client = openai_client or OpenAI(api_key=OPENAI_KEY)
+
+        raw_history = db_query(
+            "SELECT role, content FROM messages WHERE notebook_id = ? ORDER BY id DESC LIMIT 6",
+            (nid,)
+        )[::-1]
+
+        # Filter out any crisis or emergency keywords so they do not contaminate the chat context
+        history_rows = []
+        crisis_keywords = ["1122", "988", "crisis", "suicide", "kill me", "hurt yourself", "emergency department"]
+        for m in raw_history:
+            c_low = m["content"].lower()
+            if not any(k in c_low for k in crisis_keywords):
+                history_rows.append(m)
+
+        system_prompt = (
+            "You are a helpful, clear, and intelligent AI research assistant.\n"
+            "- When answering questions based on document sources, strictly ground your facts in the provided sources and cite them inline using square brackets like [1] or [2] immediately following each claim.\n"
+            "- If multiple consecutive sentences rely on the same source, cite it only once at the end of the thought.\n"
+            "- Always cite individual sources separately (e.g. write '[1] [2]', NEVER combine into ranges like '[1-2]').\n"
+            "- Only reference a source number [N] if the fact is directly supported by that specific document snippet.\n"
+            "- For general or conversational queries, respond clearly, politely, and concisely."
         )
 
-        if not hits and not body.highlighted_context:
-            answer = "I couldn't find relevant content in your selected source(s). Try selecting another document or adding more notes."
-            citations = []
-            cost_usd = 0.0
-            prompt_tok = 0
-            comp_tok = 0
-        else:
-            raw_citations = []
-            context_parts = []
+        user_content = f"Document Sources:\n{context_str}\n\nQuestion: {question}" if context_str else f"Question: {question}"
 
-            if body.highlighted_context:
-                context_parts.append(f"[Selection] Highlighted passage from document:\n{body.highlighted_context}")
+        messages_payload = [
+            {"role": "system", "content": system_prompt},
+            *[{"role": m["role"], "content": m["content"]} for m in history_rows],
+            {"role": "user", "content": user_content}
+        ]
 
-            for idx, hit in enumerate(hits, 1):
-                raw_citations.append({
-                    "n": idx,
-                    "source_id": hit["source_id"],
-                    "source_name": hit["source_name"],
-                    "chunk_id": hit["chunk_id"],
-                    "chunk_index": hit["chunk_index"],
-                    "content": hit["content"],
-                    "snippet": hit["content"][:160] + "..." if len(hit["content"]) > 160 else hit["content"]
-                })
-                context_parts.append(f"[{idx}] (Source: {hit['source_name']})\n{hit['content']}")
+        try:
+            chat_kwargs = {
+                "model": OPENAI_MODEL,
+                "messages": messages_payload,
+            }
+            if not (OPENAI_MODEL.startswith("o1") or OPENAI_MODEL.startswith("o3") or "luna" in OPENAI_MODEL):
+                chat_kwargs["temperature"] = 0.2
 
-            context_str = "\n\n".join(context_parts)
+            try:
+                chat_res = client.chat.completions.create(**chat_kwargs)
+            except Exception as api_err:
+                if "temperature" in str(api_err).lower():
+                    chat_kwargs.pop("temperature", None)
+                    chat_res = client.chat.completions.create(**chat_kwargs)
+                else:
+                    raise api_err
 
-            if OPENAI_KEY:
-                from openai import OpenAI
-                client = OpenAI(api_key=OPENAI_KEY)
+            raw_answer = chat_res.choices[0].message.content or ""
+            prompt_tok = chat_res.usage.prompt_tokens if chat_res.usage else 0
+            comp_tok = chat_res.usage.completion_tokens if chat_res.usage else 0
+            
+            p_rates = PRICING.get(OPENAI_MODEL, PRICING.get("gpt-4o-mini", {"input": 0.150 / 1_000_000, "output": 0.600 / 1_000_000}))
+            cost_usd = (prompt_tok * p_rates["input"]) + (comp_tok * p_rates["output"]) + ret_cost
 
-                history_rows = db_query(
-                    "SELECT role, content FROM messages WHERE notebook_id = ? ORDER BY id DESC LIMIT 6",
-                    (nid,)
-                )[::-1]
+            # Normalize citation tags, deduplicate consecutive repeats, and re-index sequentially
+            normalized_answer = deduplicate_citations(normalize_citation_tags(raw_answer))
+            old_to_new = {}
+            used_citations = []
+            for m in re.finditer(r"\[(\d+)\]", normalized_answer):
+                old_n = int(m.group(1))
+                if old_n not in old_to_new and 1 <= old_n <= len(raw_citations):
+                    new_n = len(old_to_new) + 1
+                    old_to_new[old_n] = new_n
+                    orig = raw_citations[old_n - 1].copy()
+                    orig["n"] = new_n
 
-                system_prompt = (
-                    "You are an AI research assistant. Your task is to answer questions strictly, clearly, and accurately using the provided numbered document sources.\n"
-                    "Citation Rules:\n"
-                    "- Format citations inline using square brackets like [1] or [2] immediately following each specific claim or quote.\n"
-                    "- Always cite individual sources separately (e.g. write '[1] [2]', NEVER combine into ranges like '[1-2]').\n"
-                    "- Only reference a source number [N] if the fact is directly supported by that specific document snippet.\n"
-                    "- If the provided sources do not contain sufficient information to answer the question, clearly state that the sources do not provide the information."
-                )
+                    # Extract the exact claim sentence preceding this citation
+                    preceding_text = normalized_answer[:m.start()].strip()
+                    claim_sentence = ""
+                    if preceding_text:
+                        prev_sents = re.split(r"(?<=[.!?\n])\s+", preceding_text)
+                        claim_sentence = re.sub(r"\[\d+\]", "", prev_sents[-1]).strip()
 
-                messages_payload = [
-                    {"role": "system", "content": system_prompt},
-                    *[{"role": m["role"], "content": m["content"]} for m in history_rows],
-                    {"role": "user", "content": f"Document Sources:\n{context_str}\n\nQuestion: {question}"}
-                ]
+                    grounded = extract_grounded_passage(claim_sentence, orig.get("content", ""))
+                    orig["content"] = grounded
+                    orig["highlight_text"] = grounded
+                    orig["snippet"] = grounded[:180] + "..." if len(grounded) > 180 else grounded
+                    used_citations.append(orig)
 
-                try:
-                    chat_kwargs = {
-                        "model": OPENAI_MODEL,
-                        "messages": messages_payload,
-                    }
-                    if not (OPENAI_MODEL.startswith("o1") or OPENAI_MODEL.startswith("o3") or "luna" in OPENAI_MODEL):
-                        chat_kwargs["temperature"] = 0.2
-
-                    try:
-                        chat_res = client.chat.completions.create(**chat_kwargs)
-                    except Exception as api_err:
-                        if "temperature" in str(api_err).lower():
-                            chat_kwargs.pop("temperature", None)
-                            chat_res = client.chat.completions.create(**chat_kwargs)
-                        else:
-                            raise api_err
-
-                    raw_answer = chat_res.choices[0].message.content or ""
-                    prompt_tok = chat_res.usage.prompt_tokens if chat_res.usage else 0
-                    comp_tok = chat_res.usage.completion_tokens if chat_res.usage else 0
-                    
-                    p_rates = PRICING.get(OPENAI_MODEL, PRICING.get("gpt-4o-mini", {"input": 0.150 / 1_000_000, "output": 0.600 / 1_000_000}))
-                    cost_usd = (prompt_tok * p_rates["input"]) + (comp_tok * p_rates["output"]) + ret_cost
-
-                    # Normalize citation tags and re-index sequentially
-                    normalized_answer = normalize_citation_tags(raw_answer)
-                    old_to_new = {}
-                    used_citations = []
-                    for m in re.finditer(r"\[(\d+)\]", normalized_answer):
-                        old_n = int(m.group(1))
-                        if old_n not in old_to_new and 1 <= old_n <= len(raw_citations):
-                            new_n = len(old_to_new) + 1
-                            old_to_new[old_n] = new_n
-                            orig = raw_citations[old_n - 1].copy()
-                            orig["n"] = new_n
-                            used_citations.append(orig)
-
-                    if old_to_new:
-                        answer = re.sub(r"\[(\d+)\]", lambda m: f"[{old_to_new.get(int(m.group(1)), m.group(1))}]", normalized_answer)
-                        citations = used_citations
-                    else:
-                        answer = normalized_answer
-                        citations = raw_citations if re.search(r"\[\d+\]", answer) else []
-
-                except Exception as e:
-                    raise HTTPException(502, f"OpenAI generation failed: {e}")
+            if old_to_new:
+                answer = re.sub(r"\[(\d+)\]", lambda m: f"[{old_to_new.get(int(m.group(1)), m.group(1))}]", normalized_answer)
+                citations = used_citations
             else:
-                cost_usd = 0.0
-                prompt_tok = 0
-                comp_tok = 0
-                citations = raw_citations
-                answer = "### Matching Passages (Local Mode):\n\n" + "\n\n".join(
-                    f"**[{c['n']}] {c['source_name']}:**\n> {hits[i]['content']}" for i, c in enumerate(citations)
-                )
+                answer = normalized_answer
+                citations = []
+
+        except Exception as e:
+            raise HTTPException(502, f"OpenAI generation failed: {e}")
+    else:
+        cost_usd = 0.0
+        prompt_tok = 0
+        comp_tok = 0
+        citations = raw_citations
+        for c in citations:
+            c["highlight_text"] = c.get("content", "")
+        answer = "### Matching Passages (Local Mode):\n\n" + "\n\n".join(
+            f"**[{c['n']}] {c['source_name']}:**\n> {hits[i]['content']}" for i, c in enumerate(citations)
+        )
 
     latency_s = round(time.time() - t0, 2)
 

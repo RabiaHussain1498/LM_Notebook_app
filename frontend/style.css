@@ -731,6 +731,8 @@ body {
   white-space: normal;
   word-break: break-word;
   text-align: left;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .cite-tooltip::after {
